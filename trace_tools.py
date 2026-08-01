@@ -84,6 +84,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import signal
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -605,6 +606,138 @@ def select_counterexamples(failures, k):
             selected.append(bucket.pop(0))
         i += 1
     return selected[:k]
+
+
+def atomic_write_text(path, content):
+    """
+    Write text to `path` without ever leaving a truncated/partial file on
+    disk if the process is interrupted mid-write (Ctrl+C, kill, crash).
+    Writes to a temp file in the SAME directory (so the final os.replace()
+    is an atomic rename on the same filesystem, not a cross-filesystem copy)
+    then atomically swaps it into place. Until that final replace, `path`
+    still holds whatever it held before this call — either the old complete
+    content or nothing at all — never a half-written new version.
+    Used for files that get read back later (candidate_round{N}.py is read
+    by the next round's revision prompt build; prompt_round{N}.txt is meant
+    to be openable/inspectable during the --automatic-off pause) where a
+    truncated read would cause a confusing downstream failure rather than
+    just being obviously-missing.
+    """
+    path = Path(path)
+    fd, tmp_path = tempfile.mkstemp(
+        dir=str(path.parent) or ".", prefix=f".{path.name}.", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp_path, path)
+    except BaseException:
+        # Covers a forced second-Ctrl+C KeyboardInterrupt landing mid-write
+        # too (BaseException, not Exception) — clean up the temp file rather
+        # than leaving a stray .tmp artifact, then let the interrupt/error
+        # propagate normally. `path` itself was never touched, so it's still
+        # whatever it was before this call.
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def pause_for_confirmation(label, path):
+    """
+    Block on stdin asking whether to continue, unless --automatic was passed.
+    Used by cmd_run_loop to pause after each round's prompt (seed or revision)
+    is written to disk but BEFORE it's sent to the LLM — gives you a chance to
+    open the file and eyeball/edit it first. Any answer other than explicit
+    'n'/'no' is treated as "continue" (bare Enter just continues), so pausing
+    at every round is a lightweight inspection point, not a repeated hurdle.
+    An EOF/interrupt on stdin (e.g. running this non-interactively without
+    --automatic by mistake) also aborts, rather than hanging or looping.
+
+    Ctrl+C here is handled directly (rather than via GracefulInterrupt below)
+    because this point is already safe to stop at immediately: the prompt
+    file is already fully written and closed, and no LLM call or subprocess
+    is in flight yet — there's nothing to protect by deferring.
+    """
+    prompt = f"{label} written to {path}. Continue? [Y/n] "
+    try:
+        resp = input(prompt).strip().lower()
+    except EOFError:
+        print("\nNo input available to confirm continuation (stdin closed). "
+              "Pass --automatic to run without pausing. Aborting.")
+        sys.exit(130)
+    except KeyboardInterrupt:
+        print("\nAborted by user (Ctrl+C) at the confirmation prompt.")
+        sys.exit(130)
+    if resp in ("n", "no"):
+        print("Aborted by user before this round's LLM call.")
+        sys.exit(130)
+
+
+class GracefulInterrupt:
+    """
+    Context manager for the risky span of a round: the LLM call, candidate
+    extraction/write, sandboxed backtest, and log write — the operations
+    that are either expensive to redo (an LLM generation that can take
+    minutes on local GPU inference) or briefly touch disk in a way that's
+    safer to let finish than to abort mid-write.
+
+    First Ctrl+C inside the `with` block: caught here, NOT re-raised. Sets
+    `.requested = True` and prints a message, then returns control to
+    whatever was running (the LLM call, the subprocess wait, etc.), which
+    continues uninterrupted to its natural completion. The caller is
+    expected to check `.requested` right after the `with` block ends and
+    stop the outer loop there — i.e. the current round is allowed to finish
+    and be recorded normally; only the *next* round is skipped.
+
+    Second Ctrl+C inside the same `with` block: treated as "no, I really
+    mean now" — restores Python's default SIGINT behavior and lets it raise
+    KeyboardInterrupt immediately, same as if this handler were never
+    installed. This is a deliberate escape hatch for a hung/slow call the
+    person doesn't want to wait out; whatever partial state that leaves is
+    the tradeoff being knowingly accepted at that point (mitigated, but not
+    eliminated, by the prompt/candidate files being written atomically —
+    see atomic_write_text below — so a forced exit can at worst leave a
+    round's *files* missing, never half-written/corrupted).
+
+    Note this only ever affects the *parent* Python process's own signal
+    handling. The sandboxed candidate subprocess (bwrap) shares this
+    process's terminal foreground group and can still receive SIGINT
+    directly from the terminal on the very first Ctrl+C, independent of
+    this handler — if that happens mid-backtest, the subprocess call
+    returns early with a nonzero/negative return code, which the existing
+    exception handling in cmd_run_loop already treats as a failed/0%-scoring
+    round rather than crashing, so this is a safe (if slightly surprising)
+    outcome, not a new hole.
+    """
+
+    def __init__(self):
+        self.requested = False
+        self._first_handler_installed = False
+        self._old_handler = None
+
+    def _handle_first(self, signum, frame):
+        self.requested = True
+        print("\nInterrupt received — finishing the current round (LLM call/"
+              "backtest/log write in progress), then stopping before the "
+              "next round. Press Ctrl+C again to stop immediately instead "
+              "(may leave this round's files missing, though never "
+              "half-written).")
+        # Escalate: a second Ctrl+C should behave like an ordinary,
+        # immediate interrupt rather than being swallowed a second time.
+        signal.signal(signal.SIGINT, self._old_handler)
+
+    def __enter__(self):
+        self._old_handler = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, self._handle_first)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        signal.signal(signal.SIGINT, self._old_handler)
+        return False  # never swallow an exception (e.g. a forced second Ctrl+C)
 
 
 # ---------- subcommands ----------
@@ -1189,13 +1322,21 @@ def cmd_run_loop(args):
         if counterexamples is None:
             prompt_text, n_used = build_initial_prompt(history_records, args.max_examples, encoding=encoding)
             print(f"Round {round_n}: seed prompt with {n_used} examples")
+            round_label = f"Round {round_n}: Prompt"
         else:
             prev_candidate_code = Path(workdir / f"candidate_round{round_n - 1}.py").read_text()
             prompt_text = build_revise_prompt(prev_candidate_code, counterexamples, encoding=encoding)
             print(f"Round {round_n}: revision prompt with {len(counterexamples)} counterexamples")
+            round_label = f"Round {round_n}: Revision Prompt"
 
         prompt_path = workdir / f"prompt_round{round_n}.txt"
-        prompt_path.write_text(prompt_text)
+        atomic_write_text(prompt_path, prompt_text)
+
+        # By default (no --automatic), pause here: the prompt is on disk but
+        # has NOT yet been sent to the LLM, so this is the point to open
+        # prompt_path and inspect/edit it before committing GPU/API time to it.
+        if not args.automatic:
+            pause_for_confirmation(round_label, prompt_path)
 
         if tokenize is not None:
             # Real tokenizer from the loaded model — this is the number that
@@ -1217,67 +1358,82 @@ def cmd_run_loop(args):
                   f"(no local tokenizer for --backend openai — token count not verified "
                   f"against the server's context window; watch for a context-length error)")
 
-        call_result = llm_call(prompt_text)
-        response = call_result["text"]
-        finish_reason = call_result.get("finish_reason")
-        completion_tokens = call_result.get("completion_tokens")
-        # finish_reason == "length" means generation was cut off by --max-tokens
-        # mid-thought (a genuinely truncated response). finish_reason == "stop"
-        # means the model emitted an end-of-sequence token on its own — the
-        # response text can look identical either way, but "stop" with a short
-        # completion_tokens count points at the model ending early on its own
-        # (e.g. from --presence-penalty/--frequency-penalty pressure building up
-        # over the response and making "just stop" look attractive), not at
-        # --max-tokens being too small.
-        print(f"Round {round_n}: generation finished with reason={finish_reason!r}"
-              + (f", {completion_tokens} completion tokens" if completion_tokens is not None else "")
-              + (f" (out of --max-tokens {args.max_tokens} budget)" if finish_reason == "length" else ""))
-        code = extract_code(response)
-        code, n_defs = keep_first_function_def(code)
-        if n_defs > 1:
-            print(f"Round {round_n}: candidate defined predict_next_state {n_defs} times "
-                  f"(re-attempts); keeping only the first, discarding the rest")
-        candidate_path = workdir / f"candidate_round{round_n}.py"
-        candidate_path.write_text(code)
+        # Everything from here through the log write is the "risky" span this
+        # round can't cleanly redo if interrupted mid-flight (an LLM
+        # generation can take minutes; a killed sandboxed backtest just looks
+        # like a failed round rather than corrupting anything — see
+        # GracefulInterrupt's docstring). A first Ctrl+C here is deferred
+        # until this block finishes naturally; a second Ctrl+C forces an
+        # immediate stop.
+        with GracefulInterrupt() as interrupt:
+            call_result = llm_call(prompt_text)
+            response = call_result["text"]
+            finish_reason = call_result.get("finish_reason")
+            completion_tokens = call_result.get("completion_tokens")
+            # finish_reason == "length" means generation was cut off by --max-tokens
+            # mid-thought (a genuinely truncated response). finish_reason == "stop"
+            # means the model emitted an end-of-sequence token on its own — the
+            # response text can look identical either way, but "stop" with a short
+            # completion_tokens count points at the model ending early on its own
+            # (e.g. from --presence-penalty/--frequency-penalty pressure building up
+            # over the response and making "just stop" look attractive), not at
+            # --max-tokens being too small.
+            print(f"Round {round_n}: generation finished with reason={finish_reason!r}"
+                  + (f", {completion_tokens} completion tokens" if completion_tokens is not None else "")
+                  + (f" (out of --max-tokens {args.max_tokens} budget)" if finish_reason == "length" else ""))
+            code = extract_code(response)
+            code, n_defs = keep_first_function_def(code)
+            if n_defs > 1:
+                print(f"Round {round_n}: candidate defined predict_next_state {n_defs} times "
+                      f"(re-attempts); keeping only the first, discarding the rest")
+            candidate_path = workdir / f"candidate_round{round_n}.py"
+            atomic_write_text(candidate_path, code)
 
-        try:
-            scored, accuracy = score_candidate(candidate_path, heldout_records, **run_kwargs)
-        except (ValueError, RuntimeError, SyntaxError, OSError) as e:
-            # A candidate that fails to even run — bad import (ValueError from
-            # check_ast_imports), sandbox/runner failure (RuntimeError), or
-            # unparseable code (SyntaxError from ast.parse — e.g. a truncated
-            # generation that got cut off by --max-tokens or a repetition loop
-            # before finishing) — is scored as a zero-accuracy round rather
-            # than killing the whole loop. SyntaxError is NOT a ValueError/
-            # RuntimeError subclass, so it must be listed explicitly or it
-            # propagates straight past this except clause and crashes cmd_run_loop.
-            print(f"Round {round_n}: candidate failed to execute cleanly: "
-                  f"{type(e).__name__}: {e}")
-            scored, accuracy = [], 0.0
+            try:
+                scored, accuracy = score_candidate(candidate_path, heldout_records, **run_kwargs)
+            except (ValueError, RuntimeError, SyntaxError, OSError) as e:
+                # A candidate that fails to even run — bad import (ValueError from
+                # check_ast_imports), sandbox/runner failure (RuntimeError), or
+                # unparseable code (SyntaxError from ast.parse — e.g. a truncated
+                # generation that got cut off by --max-tokens or a repetition loop
+                # before finishing) — is scored as a zero-accuracy round rather
+                # than killing the whole loop. SyntaxError is NOT a ValueError/
+                # RuntimeError subclass, so it must be listed explicitly or it
+                # propagates straight past this except clause and crashes cmd_run_loop.
+                print(f"Round {round_n}: candidate failed to execute cleanly: "
+                      f"{type(e).__name__}: {e}")
+                scored, accuracy = [], 0.0
 
-        n_pass = sum(1 for s in scored if s["passed"])
-        n_total = len(heldout_records)
-        summary = summarize_scores(scored) if scored else None
-        log_entry = {
-            "round": round_n,
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "candidate": str(candidate_path),
-            "heldout_accuracy": accuracy,
-            "n_passed": n_pass,
-            "n_total": n_total,
-            "heldout_mean_cell_accuracy": summary["mean_cell_accuracy"] if summary else None,
-            "heldout_mean_changed_cell_accuracy": summary["mean_changed_cell_accuracy"] if summary else None,
-            "heldout_n_dynamic_records": summary["n_dynamic_records"] if summary else None,
-            "heldout_by_action": summary["by_action"] if summary else None,
-        }
-        if args.log:
-            with open(args.log, "a") as f:
-                f.write(json.dumps(log_entry) + "\n")
+            n_pass = sum(1 for s in scored if s["passed"])
+            n_total = len(heldout_records)
+            summary = summarize_scores(scored) if scored else None
+            log_entry = {
+                "round": round_n,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "candidate": str(candidate_path),
+                "heldout_accuracy": accuracy,
+                "n_passed": n_pass,
+                "n_total": n_total,
+                "heldout_mean_cell_accuracy": summary["mean_cell_accuracy"] if summary else None,
+                "heldout_mean_changed_cell_accuracy": summary["mean_changed_cell_accuracy"] if summary else None,
+                "heldout_n_dynamic_records": summary["n_dynamic_records"] if summary else None,
+                "heldout_by_action": summary["by_action"] if summary else None,
+            }
+            if args.log:
+                with open(args.log, "a") as f:
+                    f.write(json.dumps(log_entry) + "\n")
+                    f.flush()
+                    os.fsync(f.fileno())
 
         print(f"Round {round_n}: held-out accuracy {accuracy:.1%} ({n_pass}/{n_total}), "
               f"threshold {args.threshold:.1%}")
         if summary:
             print_score_summary(summary, label="held-out")
+
+        if interrupt.requested:
+            print(f"STOP: interrupted after round {round_n} completed. "
+                  f"Last completed candidate: {candidate_path}")
+            return
 
         if accuracy >= args.threshold:
             print(f"STOP: threshold met at round {round_n}. Final candidate: {candidate_path}")
@@ -1443,6 +1599,14 @@ def main():
     p_loop.add_argument("--max-rounds", type=int, default=10)
     p_loop.add_argument("--k", type=int, default=10, help="Counterexamples per revision round")
     p_loop.add_argument("--log", default="rounds.jsonl")
+    p_loop.add_argument("--automatic", action="store_true",
+                         help="Run every round back-to-back with no pauses. Default (flag "
+                              "off): after each round's prompt (seed or revision) is written "
+                              "to --workdir, the loop stops and asks whether to continue — "
+                              "before that round's LLM call is made — so you can open and "
+                              "inspect/edit prompt_round{N}.txt first. Answer 'n' to abort "
+                              "the run at that point; anything else (including a bare Enter) "
+                              "continues.")
     p_loop.add_argument("--cpu-seconds", type=int, default=10)
     p_loop.add_argument("--max-procs", type=int, default=16,
                          help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
