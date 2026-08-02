@@ -1,81 +1,93 @@
 #!/usr/bin/env python3
 """
-trace_tools.py — Phase 4 prep for Eidolon's predict_next_state validation.
+trace_tools.py — chunked-curriculum program synthesis harness for Eidolon's
+GameModel candidates (ARC-AGI-3).
 
 Pipeline:
   1. inspect        Look at trace.jsonl structure without dumping raw grid values.
                      Specifically checks whether the frame field is a single grid
                      per record or an accumulating list-of-frames.
-  2. preprocess     Collapse each record down to {step, action, grid} — one
-                     current grid per observation, dropping any redundant
+  2. preprocess     Collapse each record down to {step, action, grid_before,
+                     grid_after, levels_completed_before/after} — one cleaned
+                     transition per observation, dropping any redundant
                      history the raw FrameData carries.
-  3. split          Chronological 70/30 split of the cleaned trace into
-                     history (shown to the model) vs. held-out (ground truth
-                     to check predictions against).
-  4. prompt         Build the round-1 synthesis prompt from a spread-out
-                     subsample of history, using a compact grid encoding to
-                     keep token count down. Two grid encodings are available:
-                     one-hex-char-per-cell (default) or --compact (run-length
-                     encoded rows, e.g. "0*7 3*2"), which cuts tokens further
-                     for large/sparse grids. NOTE: grid content tokenizes far
-                     worse than English prose (close to 1 token/char, not the
-                     usual ~4 chars/token), so the printed token estimate for
+  3. prompt         Build chunk 1's seed prompt (PROMPT_TEMPLATE) from the
+                     first --max-examples rows of a records file, using a
+                     compact grid encoding to keep token count down. Two
+                     grid encodings are available: one-hex-char-per-cell
+                     (default) or --compact (run-length encoded rows, e.g.
+                     "0*7 3*2"), which cuts tokens further for large/sparse
+                     grids. NOTE: grid content tokenizes far worse than
+                     English prose (close to 1 token/char, not the usual ~4
+                     chars/token), so the printed token estimate for
                      `prompt`/`revise-prompt` uses a 1:1 chars-to-tokens
                      fallback rather than chars/4 — it's still a rough
                      estimate since no real tokenizer is loaded on that path.
-  5. score          Sandboxed test of a candidate predict_next_state.py against
-                     any cleaned dataset (history or held-out). No LLM calls —
-                     this is plain Python execution, so it's fast and has no
-                     context-window limit no matter how much history you have.
-  6. evaluate       The stop condition for the verify-and-revise (CEGIS) loop:
-                     scores the candidate against held-out only and logs the
-                     round. Exit codes drive an orchestrating shell loop:
-                       0 = STOP, held-out accuracy met --threshold
-                       1 = CONTINUE, threshold not yet met, rounds remain —
-                           writes fresh counterexamples from HISTORY (never
-                           held-out) to --counterexamples-out for the next
-                           revision prompt, if --history is also given
-                       2 = STOP, --max-rounds reached without meeting threshold
-  7. revise-prompt  Build a round-2+ prompt from a candidate's current code
-                     plus the counterexamples `evaluate` just wrote — shows
-                     the model what it predicted vs. what actually happened,
-                     and asks for a fix rather than a rewrite from scratch.
-  8. run-loop       Fully automated version of prompt -> LLM -> evaluate ->
-                     revise-prompt -> LLM -> ..., calling the model directly
-                     each round instead of manual copy-paste. Supports two
-                     backends: `llama-cpp` (llama-cpp-python loading a local
-                     GGUF in-process — the default, and what you'd use for a
-                     quantized model on Jarvislabs) or `openai` (an
-                     OpenAI-compatible HTTP server, e.g. vLLM or llama-server,
-                     if you go that route instead). Also supports --compact
-                     (see `prompt` above). Before each round's LLM call, if a
-                     local tokenizer is available (--backend llama-cpp), the
-                     actual prompt is tokenized via the loaded model and
-                     checked against --n-ctx minus --max-tokens, failing fast
-                     with a clear message instead of letting llama-cpp raise
-                     a raw "Requested tokens exceed context window" error
-                     mid-generation. --backend openai has no local tokenizer,
-                     so that preflight check is skipped and only a char count
-                     is printed. --verbose-llama surfaces llama.cpp's own
-                     load-time log (actual GPU-offloaded layer count — GPU
-                     memory usage alone doesn't confirm this) and per-call
-                     prompt-eval/generation tokens-per-second, useful for
-                     diagnosing an unexpectedly slow round.
+  4. backtest       Full teacher-forced replay of a candidate GameModel class
+                     against a trace (or a row_range[0:boundary] slice of
+                     one), scoring per-row with goal discounting (a
+                     candidate that predicts a level-completion transition
+                     has its grid prediction excluded from scoring, since
+                     it can't know the next level's starting grid) and
+                     updating the persistent row_failure_counts.json that
+                     `revise-prompt`/`run-chunked` read. No LLM calls —
+                     plain sandboxed Python execution.
+  5. revise-prompt  Build a round-2+ prompt from a candidate's current code
+                     plus row_failure_counts.json (written by `backtest`) —
+                     selects the --k rows with the highest failure count
+                     across the whole trace-so-far, shows the model what it
+                     predicted vs. what actually happened for each, and
+                     asks for a fix to the GameModel class rather than a
+                     rewrite from scratch.
+  6. run-chunked    The actual chunked-curriculum harness this project runs.
+                     Loads ONE full cleaned trace file, chronologically, no
+                     split. Drives an outer loop over chunks (each chunk's
+                     boundary is whichever comes soonest of: a fixed
+                     --max-examples row cap, a level completion, or the end
+                     of the trace), each running an inner loop of up to
+                     --max-rounds rounds (chunk 1: seed PROMPT_TEMPLATE;
+                     every later chunk's round 1: EXTEND_TEMPLATE against a
+                     freshly-recomputed baseline; every round after: the
+                     row_failure_counts.json-driven REVISE_TEMPLATE),
+                     accepting or rejecting each round's candidate against
+                     whichever code came before it (never regressing more
+                     than a small fixed tolerance) and stopping a chunk
+                     early the moment it hits zero failing rows. Reports
+                     after every chunk and persists whichever code each
+                     chunk ends with as the next chunk's starting point.
+                     Supports two backends: `llama-cpp` (llama-cpp-python
+                     loading a local GGUF in-process — the default, and
+                     what you'd use for a quantized model on Jarvislabs) or `openai` (an
+                     OpenAI-compatible HTTP server, e.g. vLLM or
+                     llama-server, if you go that route instead). Before
+                     each round's LLM call, if a local tokenizer is
+                     available (--backend llama-cpp), the actual prompt is
+                     tokenized via the loaded model and checked against
+                     --n-ctx minus --max-tokens, failing fast with a clear
+                     message instead of letting llama-cpp raise a raw
+                     "Requested tokens exceed context window" error
+                     mid-generation. --backend openai has no local
+                     tokenizer, so that preflight check is skipped and only
+                     a char count is printed. --verbose-llama surfaces
+                     llama.cpp's own load-time log (actual GPU-offloaded
+                     layer count — GPU memory usage alone doesn't confirm
+                     this) and per-call prompt-eval/generation
+                     tokens-per-second, useful for diagnosing an
+                     unexpectedly slow round. By default (no --automatic),
+                     pauses before every round's LLM call so the written
+                     prompt can be inspected/edited first.
 
 Usage:
   python trace_tools.py inspect trace.jsonl --frame-key frame
   python trace_tools.py preprocess trace.jsonl clean.jsonl --frame-key frame --action-key action
-  python trace_tools.py split clean.jsonl history.jsonl heldout.jsonl --history-frac 0.7
-  python trace_tools.py prompt history.jsonl prompt.txt --max-examples 25
-  python trace_tools.py score candidate.py history.jsonl --out results.jsonl
-  python trace_tools.py evaluate candidate.py heldout.jsonl --round 1 --threshold 0.95 \\
-      --max-rounds 10 --log rounds.jsonl --history history.jsonl \\
-      --counterexamples-out next_counterexamples.jsonl
-  python trace_tools.py revise-prompt candidate.py next_counterexamples.jsonl revision_prompt.txt
-  python trace_tools.py run-loop history.jsonl heldout.jsonl \\
+  python trace_tools.py prompt clean.jsonl prompt.txt --max-examples 25
+  python trace_tools.py backtest candidate.py clean.jsonl --boundary 50 --counts row_failure_counts.json
+  python trace_tools.py revise-prompt candidate.py row_failure_counts.json revision_prompt.txt --k 10
+  python trace_tools.py run-chunked clean.jsonl \\
       --backend llama-cpp --model-path /path/to/model.Q4_K_M.gguf \\
-      --n-gpu-layers -1 --n-ctx 32768 --threshold 0.95 --max-rounds 10 \\
-      --compact --repeat-penalty 1.3 --frequency-penalty 0.1 --presence-penalty 0.1
+      --n-gpu-layers -1 --n-ctx 32768 --max-examples 25 --max-rounds 2 \\
+      --compact --repeat-penalty 1.3 --frequency-penalty 0.1 --presence-penalty 0.1 \\
+      --workdir chunked_run --automatic
 """
 import argparse
 import json
@@ -378,8 +390,9 @@ except Exception as e:
 # exactly what the candidate's own predict() returned on the previous row;
 # the harness never reconstructs or corrects it. grid_before, in contrast, is
 # always the true grid from the trace for every row (teacher-forced at the
-# grid level, per design doc §1) — a wrong prediction never contaminates the
-# next row's grid input, only `state` can drift.
+# grid level, so a candidate never has to compound its own past mistakes) —
+# a wrong prediction never contaminates the next row's grid input, only
+# `state` can drift.
 state = {{}}
 
 # Feeding the whole row range for this call into stdin upfront (see
@@ -398,11 +411,15 @@ for line in sys.stdin:
     try:
         predicted_grid_after, goal, state = model.predict(rec["grid_before"], rec["action"], state)
     except Exception as e:
-        # Abort-on-crash (design doc §1): don't try to carry the last-good
-        # state forward and keep going — emit this row as an error and stop
-        # the whole sequential pass right here. Every row after this one is
-        # simply never emitted; the parent process's scoring treats "no
-        # result for this step" as incorrect/missing.
+        # Deliberately abort the whole sequential pass on any error rather
+        # than carrying the last-good state forward and continuing — a
+        # crash means `state` is now unknown/untrustworthy, and silently
+        # continuing with stale state would make every later row's result
+        # look like a legitimate prediction instead of what it actually is
+        # (built on data the candidate never really produced). Emit this
+        # row as an error and stop right here instead. Every row after this
+        # one is simply never emitted; the parent process's scoring treats
+        # "no result for this step" as incorrect/missing.
         signal.alarm(0)
         print(json.dumps({{"step": rec["step"], "error": f"{{type(e).__name__}}: {{e}}"}}))
         break
@@ -431,8 +448,9 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
     prediction never compounds forward; only candidate-tracked `state` can
     drift on its own. If a row's predict() call raises (including a
     SIGALRM-driven timeout), the whole rollout aborts at that point — no
-    attempt is made to keep going with stale state (design doc §1) — so
-    every row from the failure point onward is simply absent from the
+    attempt is made to keep going with stale state, since a crash means
+    `state` can no longer be trusted — so every row from the failure point
+    onward is simply absent from the
     returned dict, and the caller's own scoring is responsible for treating
     a missing step as incorrect.
 
@@ -534,33 +552,6 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
     return results
 
 
-def score_candidate(candidate_path, records, **run_kwargs):
-    """
-    Run candidate against records and compare predictions to grid_after.
-    Returns (scored_records, accuracy) where each scored record gets a
-    "passed" bool, and failures additionally get the wrong "prediction".
-    """
-    raw = run_candidate(candidate_path, records, **run_kwargs)
-    scored = []
-    n_pass = 0
-    for rec in records:
-        r = raw.get(rec["step"])
-        if r is None:
-            scored.append({**rec, "passed": False, "error": "no result (crashed or timed out earlier in the batch)"})
-        elif "error" in r:
-            scored.append({**rec, "passed": False, "error": r["error"]})
-        else:
-            passed = r["prediction"] == rec["grid_after"]
-            entry = {**rec, "passed": passed}
-            if not passed:
-                entry["prediction"] = r["prediction"]
-            scored.append(entry)
-            if passed:
-                n_pass += 1
-    accuracy = n_pass / len(records) if records else 0.0
-    return scored, accuracy
-
-
 def summarize_scores(scored):
     """
     Richer diagnostics beyond the strict exact-whole-grid-match pass rate:
@@ -658,28 +649,6 @@ def print_score_summary(summary, label="held-out"):
         print(f"    {action}: {bucket['accuracy']:.1%} ({bucket['n_pass']}/{bucket['n']})")
 
 
-def select_counterexamples(failures, k):
-    """
-    Pick up to k failures spread across distinct actions (round-robin across
-    action buckets) rather than just the first k or the "worst" k, so the
-    revision prompt sees varied failure modes per token spent.
-    """
-    if len(failures) <= k:
-        return failures
-    buckets = {}
-    for f in failures:
-        buckets.setdefault(f["action"], []).append(f)
-    bucket_list = list(buckets.values())
-    selected = []
-    i = 0
-    while len(selected) < k and any(bucket_list):
-        bucket = bucket_list[i % len(bucket_list)]
-        if bucket:
-            selected.append(bucket.pop(0))
-        i += 1
-    return selected[:k]
-
-
 def atomic_write_text(path, content):
     """
     Write text to `path` without ever leaving a truncated/partial file on
@@ -721,9 +690,9 @@ def atomic_write_text(path, content):
 def pause_for_confirmation(label, path):
     """
     Block on stdin asking whether to continue, unless --automatic was passed.
-    Used by cmd_run_loop to pause after each round's prompt (seed or revision)
-    is written to disk but BEFORE it's sent to the LLM — gives you a chance to
-    open the file and eyeball/edit it first. Any answer other than explicit
+    Used by cmd_run_chunked to pause after each round's prompt (seed/extend
+    or revision) is written to disk but BEFORE it's sent to the LLM — gives
+    you a chance to open the file and eyeball/edit it first. Any answer other than explicit
     'n'/'no' is treated as "continue" (bare Enter just continues), so pausing
     at every round is a lightweight inspection point, not a repeated hurdle.
     An EOF/interrupt on stdin (e.g. running this non-interactively without
@@ -780,10 +749,14 @@ class GracefulInterrupt:
     process's terminal foreground group and can still receive SIGINT
     directly from the terminal on the very first Ctrl+C, independent of
     this handler — if that happens mid-backtest, the subprocess call
-    returns early with a nonzero/negative return code, which the existing
-    exception handling in cmd_run_loop already treats as a failed/0%-scoring
-    round rather than crashing, so this is a safe (if slightly surprising)
-    outcome, not a new hole.
+    returns early with a nonzero/negative return code, which run_candidate
+    surfaces as a RuntimeError. cmd_run_chunked deliberately does NOT catch
+    this (see _validate_candidate_code's docstring) — it propagates and
+    halts the run, same as any other genuine subprocess/infra failure,
+    rather than being silently absorbed into a fake failed round. Whatever
+    partial chunk state that leaves is the same disk-consistency guarantee
+    described above: no file involved is ever left half-written, only
+    possibly missing.
     """
 
     def __init__(self):
@@ -813,9 +786,9 @@ class GracefulInterrupt:
 
 
 # ---------- chunk boundary computation ----------
-# Pure functions, no LLM/sandbox involved — support for the chunked
-# curriculum (design doc §2): the trace is processed in chronological
-# chunks, each ending at whichever of three cutoffs comes soonest.
+# Pure functions, no LLM/sandbox involved — the trace is processed in
+# chronological chunks, each ending at whichever of three cutoffs comes
+# soonest.
 #
 # Boundary values (`prev_boundary`, the return value, `len(records)`) are
 # all in the same units: a CUMULATIVE ROW COUNT, i.e. "this many rows have
@@ -863,8 +836,8 @@ def next_level_completion_row(records, prev_boundary):
 
 def next_chunk_boundary(records, prev_boundary, max_examples):
     """
-    Compute where the next chunk ends, per design doc §2's boundary rule.
-    Three cutoffs compete; whichever is soonest (smallest) wins:
+    Compute where the next chunk ends. Three cutoffs compete; whichever is
+    soonest (smallest) wins:
       - the normal fixed chunk-size cap, prev_boundary + max_examples
       - the whole-trace cutoff, len(records) — the final chunk may be short
       - a level cutoff, if a level completes before either of the above
@@ -891,17 +864,17 @@ def next_chunk_boundary(records, prev_boundary, max_examples):
     return next_boundary, is_level_boundary
 
 
-# ---------- backtest (chunked design): full replay, scoring, goal discounting ----------
-# Step 6 of the chunked-curriculum design (design doc §6, §9). Distinct from
-# score_candidate/summarize_scores above, which remain exactly as-is for the
-# older flat harness (score/evaluate/run-loop) they still serve.
+# ---------- backtest: full replay, scoring, goal discounting ----------
+# Full teacher-forced replay of a candidate against a trace, with
+# persistent per-row failure tracking across rounds/chunks (see
+# run_backtest and load_row_failure_counts below).
 
 def atomic_write_json(path, data):
     """
     Write `data` as JSON to `path` via temp-file-then-os.replace(), so a
     process interruption mid-write can never leave `path` corrupted or
-    half-written. Shared by run_backtest (row_failure_counts.json) and
-    Step 8's commit/revert snapshot (row_failure_counts_best.json).
+    half-written. Shared by run_backtest (row_failure_counts.json) and the
+    per-chunk round loop's commit/revert snapshot (row_failure_counts_best.json).
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -922,10 +895,10 @@ def atomic_write_json(path, data):
 
 def load_row_failure_counts(path):
     """
-    Load the persistent per-row failure-tracking file (design doc §6), or
-    an empty dict if it doesn't exist yet (the very first backtest call of
-    a run). Keys are trace step indices stored as strings (JSON object keys
-    are always strings) -- callers should key lookups with str(step).
+    Load the persistent per-row failure-tracking file, or an empty dict if
+    it doesn't exist yet (the very first backtest call of a run). Keys are
+    trace step indices stored as strings (JSON object keys are always
+    strings) -- callers should key lookups with str(step).
     """
     path = Path(path)
     if not path.exists():
@@ -937,11 +910,10 @@ def load_row_failure_counts(path):
 def actual_goal_for_record(rec):
     """
     Ground truth for goal-reached on a single row: levels_completed_after >
-    levels_completed_before, both extracted per-row during preprocessing
-    (Step 4/cmd_preprocess). False if either field is missing -- a trace
-    that never carried levels_completed simply never certifies a goal
-    transition, the same graceful "no signal" treatment as
-    next_level_completion_row uses.
+    levels_completed_before, both extracted per-row by cmd_preprocess. False
+    if either field is missing -- a trace that never carried
+    levels_completed simply never certifies a goal transition, the same
+    graceful "no signal" treatment as next_level_completion_row uses.
     """
     before = rec.get("levels_completed_before")
     after = rec.get("levels_completed_after")
@@ -953,24 +925,24 @@ def actual_goal_for_record(rec):
 def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
     """
     Full teacher-forced replay of records[0:boundary] against candidate_path
-    (Step 3's sequential/stateful runner), scored per design doc §9, with
-    the persistent per-row row_failure_counts.json (design doc §6) read at
-    the start and rewritten at the end.
+    (run_candidate's sequential/stateful runner), with the persistent
+    per-row row_failure_counts.json read at the start and rewritten at the
+    end.
 
     Per-row scoring:
-      - A row that crashed, timed out, or was never reached (Step 3's
+      - A row that crashed, timed out, or was never reached (run_candidate's
         abort-on-crash cut the replay short before this row) always counts
         as a failure. No grid/goal comparison is attempted for it.
       - predicted_goal == actual_goal is always required for a pass — both
         false positives and false negatives count as incorrect, no
-        exemption (design doc §9).
-      - GOAL-DISCOUNTING DECISION (explicit, as Step 6 asks to note in code
-        rather than leave ambiguous): when predicted_goal is True, the grid
-        comparison is EXCLUDED ENTIRELY from the pass/fail decision for
-        that row — not scored-but-flagged. The candidate cannot know the
-        next level's initial grid, so holding a wrong predicted_grid_after
-        against it on a row it itself flagged as a level transition isn't
-        meaningful. Concretely:
+        exemption.
+      - GOAL-DISCOUNTING DECISION (explicit, rather than left ambiguous):
+        when predicted_goal is True, the grid comparison is EXCLUDED
+        ENTIRELY from the pass/fail decision for that row — not
+        scored-but-flagged. The candidate cannot know the next level's
+        initial grid, so holding a wrong predicted_grid_after against it on
+        a row it itself flagged as a level transition isn't meaningful.
+        Concretely:
           predicted_goal == True:  passed = (predicted_goal == actual_goal)
           predicted_goal == False: passed = (predicted_goal == actual_goal)
                                             and (predicted_grid_after == actual_grid_after)
@@ -990,13 +962,12 @@ def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
     "predicted_goal", "actual_goal", "goal_discounted" (bool — whether grid
     comparison was excluded for this row), "prediction" (present whenever a
     predicted grid exists at all, i.e. no error — regardless of pass/fail,
-    unlike score_candidate's failed-only convention, since a revision
-    prompt may still want a discounted row's prediction later), and
-    "error" (if the row crashed or was never reached).
+    since a revision prompt may still want a discounted row's prediction
+    later), and "error" (if the row crashed or was never reached).
 
     row_failure_counts.json is read-mutated-written UNCONDITIONALLY on
     every call, including rounds a caller later rejects — this function
-    does not know or care about accept/reject. Step 8 owns the
+    does not know or care about accept/reject. run_chunk_rounds owns the
     commit/revert snapshot (row_failure_counts_best.json) that keeps this
     file consistent with whichever code is genuinely current-best after
     each round's decision; do not add that logic here.
@@ -1093,6 +1064,410 @@ def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
     }
 
 
+# ---------- per-chunk epsilon-reset code selection with baseline recompute ----------
+# Replaces an earlier draft's continuous best-so-far checkpoint. Two problems solved
+# simultaneously: never let a single revision regress the candidate
+# drastically without any check, and never let the candidate get stuck
+# reverting to old code that ignores new rows it hasn't learned to handle
+# yet, simply because old code's accuracy looks artificially better on a
+# smaller row range than a new candidate scored on a larger one. Solved by
+# only ever comparing accuracies measured on the SAME row range, and
+# resetting which comparison is "live" at each chunk boundary rather than
+# tracking one continuous global best.
+
+EPSILON = 0.05  # flat constant -- every chunk, every round, never scaled by chunk size
+
+
+def atomic_copy_json(src_path, dst_path):
+    """
+    Copy src_path's JSON content to dst_path via atomic_write_json's
+    temp-file-then-os.replace() pattern -- NOT a plain in-place file copy,
+    so a process interruption mid-copy can never leave dst_path corrupted
+    or half-written. Used for both directions of the
+    row_failure_counts.json <-> row_failure_counts_best.json commit/revert
+    in run_chunk_rounds below.
+
+    A missing src_path (e.g. reverting before any round has ever been
+    accepted) is treated as an empty counts file, consistent with
+    load_row_failure_counts's own missing-file handling, rather than
+    raising.
+    """
+    src_path = Path(src_path)
+    if src_path.exists():
+        with open(src_path) as f:
+            data = json.load(f)
+    else:
+        data = {}
+    atomic_write_json(dst_path, data)
+
+
+def _write_temp_candidate_file(code):
+    """Materialize a candidate code string to a throwaway temp .py file for run_backtest, which needs a path."""
+    fd, path = tempfile.mkstemp(suffix="_candidate.py", prefix="eidolon_chunk_round_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(code)
+    except BaseException:
+        os.unlink(path)
+        raise
+    return path
+
+
+def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_path,
+                      baseline_code=None, max_rounds=2, **run_kwargs):
+    """
+    Per-chunk epsilon-reset round loop: drives up to max_rounds rounds of
+    extend/revise + backtest + accept/reject for ONE chunk, keeping
+    row_failure_counts.json (`counts_path`) and row_failure_counts_best.json
+    (`best_counts_path`) in lockstep with whichever candidate is genuinely
+    current-best.
+
+    round_builder(round_n, current_best_code) -> candidate_code is supplied
+    by the caller (the outer per-chunk loop, cmd_run_chunked), not built in
+    here, so this stays testable without a real LLM call. round_n starts at
+    1: round 1 should build EXTEND_TEMPLATE (chunk 1: PROMPT_TEMPLATE) from
+    current_best_code; every round after should build REVISE_TEMPLATE from
+    current_best_code and the CURRENT row_failure_counts.json on disk at
+    counts_path (which this function keeps in lockstep with
+    current_best_code between calls -- see below). current_best_code is
+    None only on chunk 1's round 1 call (no prior code to show).
+
+    baseline_code: chunk k>1's prior current_best_code, re-backtested
+    against THIS chunk's (larger) row range before round 1 -- a "baseline
+    recompute", required because that code was previously only ever scored
+    against chunk k-1's smaller row range, so no fair same-denominator
+    comparison exists yet without it. This recompute is itself always an
+    automatic "accept" (a re-measurement of already-accepted code, not a
+    new candidate being proposed), so it commits immediately and becomes
+    what round 1 compares against and, if round 1 is rejected, what round
+    1's revert restores to. Pass None for chunk 1, which has no prior code
+    and skips this step entirely -- its round 1 is simply accepted outright
+    (nothing to compare against).
+
+    Every round's backtest mutates counts_path in place as it scores each
+    row (see run_backtest). A round's mutations must not survive if that
+    round is rejected, or a later revision prompt in this chunk would show
+    predicted_grid/predicted_goal from a discarded candidate rather than
+    the code actually still in play:
+      - ACCEPT (round's candidate becomes current-best, including the
+        automatic chunk-1/baseline-recompute/zero-failure cases): copy
+        counts_path -> best_counts_path, committing this round's mutations
+        as the new baseline-for-reverting-to.
+      - REJECT: copy best_counts_path -> counts_path, discarding this
+        round's mutations entirely and restoring the file to exactly what
+        it was after the last accepted round.
+    A single "best" snapshot is sufficient (not a per-round history stack)
+    because a reject only ever needs to undo the IMMEDIATELY PRECEDING
+    round's mutations -- the comparison chain never skips ahead or compares
+    non-adjacent rounds (each round is only ever compared against whichever
+    code was current-best going into it), so counts_path is always at most
+    one round's worth of mutations away from being correct.
+
+    Zero-failure early stop: after ANY round's own backtest (never the
+    baseline recompute) comes back with zero failing rows across the full
+    chunk row range, that round is accepted (a zero-failure candidate can
+    never be more than epsilon worse than anything, so this is never a
+    special case -- it's a trivial consequence of the accept check below)
+    and the loop stops immediately, regardless of how many rounds of
+    max_rounds remain.
+
+    **run_kwargs forwarded to run_backtest -> run_candidate (cpu_seconds,
+    mem_mb, use_sandbox, etc).
+
+    Returns:
+      {
+        "current_best_code": str,        # this chunk's final code
+        "current_best_accuracy": float,
+        "current_best_scored": [...],     # the winning round's/baseline recompute's own "scored" list (run_backtest) -- feed straight into summarize_scores/print_score_summary, never re-run
+        "current_best_streak": int,       # the winning round's/baseline recompute's own longest-pass-streak -- reported per chunk, never fed into a prompt
+        "rounds_run": int,                # how many rounds of the ROUND LOOP actually ran (excludes the baseline recompute, which isn't a "round")
+        "early_stopped": bool,
+        "rounds_skipped": int,            # max_rounds - rounds_run if early_stopped else 0
+        "log": [...],                     # one dict per event (baseline_recompute/accept/reject/early_stop) -- raw material for reporting, not printed here
+      }
+
+    On return, counts_path is guaranteed to exactly match current_best_code's
+    own backtest state -- every branch above maintains this as an invariant,
+    round by round (and the baseline recompute, chunk k>1, establishes it
+    before round 1 even runs).
+    """
+    log = []
+    current_best_code = None
+    current_best_accuracy = None
+    current_best_scored = None  # feeds summarize_scores/print_score_summary directly, once a chunk finishes
+    current_best_streak = None  # reported per chunk, never fed into a prompt
+
+    def backtest_code(code):
+        path = _write_temp_candidate_file(code)
+        try:
+            return run_backtest(path, records, boundary, counts_path, **run_kwargs)
+        finally:
+            os.unlink(path)
+
+    if baseline_code is not None:
+        result = backtest_code(baseline_code)
+        current_best_code = baseline_code
+        current_best_accuracy = result["accuracy"]
+        current_best_scored = result["scored"]
+        current_best_streak = result["streak"]
+        atomic_copy_json(counts_path, best_counts_path)  # baseline recompute is always an automatic "accept"
+        log.append({
+            "event": "baseline_recompute",
+            "accuracy": current_best_accuracy,
+            "n_pass": result["n_pass"],
+            "n_total": result["n_total"],
+            "streak": result["streak"],
+        })
+
+    round_n = 0
+    early_stopped = False
+    for round_n in range(1, max_rounds + 1):
+        candidate_code = round_builder(round_n, current_best_code)
+        result = backtest_code(candidate_code)
+        candidate_accuracy = result["accuracy"]
+
+        prev_best_accuracy = current_best_accuracy  # snapshot before this round's decision
+        # Allowed to go negative (e.g. prev_best_accuracy=0.02) and needs no
+        # clamping/special-casing: candidate_accuracy (always >= 0) then
+        # trivially clears the threshold, which is exactly the desired
+        # behavior for an already near-zero baseline (there's essentially
+        # nothing left to protect).
+        threshold = None if prev_best_accuracy is None else prev_best_accuracy - EPSILON
+        accept = threshold is None or candidate_accuracy >= threshold
+
+        if accept:
+            current_best_code, current_best_accuracy = candidate_code, candidate_accuracy
+            current_best_scored = result["scored"]
+            current_best_streak = result["streak"]
+            atomic_copy_json(counts_path, best_counts_path)  # commit this round's mutations
+            log.append({
+                "event": "accept", "round": round_n,
+                "candidate_accuracy": candidate_accuracy,
+                "prev_best_accuracy": prev_best_accuracy, "threshold": threshold,
+                "n_pass": result["n_pass"], "n_total": result["n_total"], "streak": result["streak"],
+            })
+        else:
+            atomic_copy_json(best_counts_path, counts_path)  # revert: discard this round's mutations
+            log.append({
+                "event": "reject_substitution", "round": round_n,
+                "candidate_accuracy": candidate_accuracy,
+                "prev_best_accuracy": prev_best_accuracy, "threshold": threshold,
+                "n_pass": result["n_pass"], "n_total": result["n_total"], "streak": result["streak"],
+            })
+
+        if not result["failures"]:  # zero failing rows across the FULL chunk row range this round
+            early_stopped = True
+            log.append({"event": "early_stop", "round": round_n, "rounds_skipped": max_rounds - round_n})
+            break
+
+    return {
+        "current_best_code": current_best_code,
+        "current_best_accuracy": current_best_accuracy,
+        "current_best_scored": current_best_scored,
+        "current_best_streak": current_best_streak,
+        "rounds_run": round_n,
+        "early_stopped": early_stopped,
+        "rounds_skipped": (max_rounds - round_n) if early_stopped else 0,
+        "log": log,
+    }
+
+
+# ---------- reporting ----------
+# Everything here is READ-ONLY over run_chunk_rounds' already-finished
+# decisions: it consumes the returned "log" list and
+# "current_best_scored"/"current_best_streak", and never feeds anything
+# back into code selection. No new scoring/comparison logic lives here —
+# only formatting and a running-best bookkeeping value.
+
+def _fmt_pct(x):
+    """None-safe percent formatter — chunk 1's round 1 has no baseline/threshold to show."""
+    return "n/a" if x is None else f"{x:.1%}"
+
+
+def log_code_replacement(chunk_number, entry):
+    """
+    One explicit line per ACCEPT event that replaces the chunk's current-
+    best code with a genuinely new candidate — makes replacement frequency
+    easy to scan on its own, independent of the full per-chunk detail in
+    print_chunk_report. Deliberately NOT called for a baseline-recompute
+    accept (see log_chunk_events) — recomputing an old candidate's score
+    against a new row range isn't "code changing", it's re-measuring code
+    that was already current going into this chunk.
+    """
+    print(f"[chunk {chunk_number}] CODE REPLACED at round {entry['round']}: "
+          f"{entry['candidate_accuracy']:.1%} accuracy "
+          f"(prev best {_fmt_pct(entry['prev_best_accuracy'])}, threshold {_fmt_pct(entry['threshold'])})")
+
+
+def log_substitution(chunk_number, entry):
+    """
+    One explicit line per REJECT event: the rejected round's candidate is
+    discarded outright, and whichever code was current-best going into this
+    round is carried forward unchanged — this is the log line that
+    documents that carry-forward.
+    """
+    print(f"[chunk {chunk_number}] SUBSTITUTION at round {entry['round']}: rejected "
+          f"{entry['candidate_accuracy']:.1%} accuracy candidate "
+          f"(more than epsilon={EPSILON:.0%} below prev best {_fmt_pct(entry['prev_best_accuracy'])}, "
+          f"threshold {_fmt_pct(entry['threshold'])}) — current-best carried forward unchanged")
+
+
+def log_early_stop(chunk_number, entry):
+    """
+    One explicit line per zero-failure early-stop event — a "nothing left
+    to fix" event, distinct from the code-replacement line above even
+    though a zero-failure round is always ALSO an accept (zero failures
+    trivially clears any threshold, since a threshold measures how much
+    worse a candidate is allowed to be).
+    """
+    print(f"[chunk {chunk_number}] EARLY STOP at round {entry['round']}: zero failing rows, "
+          f"skipping remaining {entry['rounds_skipped']} round(s)")
+
+
+def log_chunk_events(chunk_number, chunk_result):
+    """
+    Stream one explicit line per event in a finished chunk's log, in the
+    order they actually happened. This is what actually produces the
+    explicit code-replacement and early-stop lines — replayed after the
+    fact from run_chunk_rounds' already-tested structured log, rather than
+    requiring run_chunk_rounds itself to print anything (kept that function
+    pure/silent and unit-testable on stdout).
+    """
+    for entry in chunk_result["log"]:
+        if entry["event"] == "baseline_recompute":
+            print(f"[chunk {chunk_number}] baseline recompute: {entry['accuracy']:.1%} "
+                  f"({entry['n_pass']}/{entry['n_total']}, streak {entry['streak']})")
+        elif entry["event"] == "accept":
+            log_code_replacement(chunk_number, entry)
+        elif entry["event"] == "reject_substitution":
+            log_substitution(chunk_number, entry)
+        elif entry["event"] == "early_stop":
+            log_early_stop(chunk_number, entry)
+
+
+def build_chunk_report(chunk_number, prev_boundary, boundary, chunk_result, max_rounds):
+    """
+    Turn one finished chunk's run_chunk_rounds() return dict into a
+    structured report entry: chunk number, row range covered, baseline
+    accuracy (if applicable, chunk 1 has none), per-round accuracy/
+    accept-reject/epsilon for every round that actually ran, whether/where
+    the zero-failure early stop fired, and which round's code the chunk
+    ends with. Purely a reshaping of chunk_result — no new computation, no
+    influence on which code chunk_result picked.
+    """
+    log = chunk_result["log"]
+    baseline_entry = next((e for e in log if e["event"] == "baseline_recompute"), None)
+    round_entries = [e for e in log if e["event"] in ("accept", "reject_substitution")]
+    early_stop_entry = next((e for e in log if e["event"] == "early_stop"), None)
+
+    return {
+        "chunk": chunk_number,
+        "row_range": (prev_boundary, boundary),
+        "n_rows": boundary - prev_boundary,
+        "max_rounds": max_rounds,
+        "epsilon": EPSILON,
+        "baseline_accuracy": baseline_entry["accuracy"] if baseline_entry is not None else None,
+        "rounds": [
+            {
+                "round": e["round"],
+                "accuracy": e["candidate_accuracy"],
+                "prev_best_accuracy": e["prev_best_accuracy"],
+                "threshold": e["threshold"],
+                "decision": "accept" if e["event"] == "accept" else "reject",
+            }
+            for e in round_entries
+        ],
+        "early_stop": (
+            {"round": early_stop_entry["round"], "rounds_skipped": early_stop_entry["rounds_skipped"]}
+            if early_stop_entry is not None else None
+        ),
+        "rounds_run": chunk_result["rounds_run"],
+        "final_accuracy": chunk_result["current_best_accuracy"],
+        "streak": chunk_result["current_best_streak"],
+    }
+
+
+def print_chunk_report(report):
+    """Human-readable rendering of one build_chunk_report() entry."""
+    lo, hi = report["row_range"]
+    print(f"\n=== Chunk {report['chunk']}: rows [{lo}:{hi}) ({report['n_rows']} rows), "
+          f"epsilon={report['epsilon']:.0%}, max_rounds={report['max_rounds']} ===")
+    print(f"  baseline: {_fmt_pct(report['baseline_accuracy'])}"
+          + ("" if report["baseline_accuracy"] is not None else " (chunk 1 — no prior code)"))
+    for r in report["rounds"]:
+        marker = "ACCEPT" if r["decision"] == "accept" else "REJECT"
+        print(f"  round {r['round']}: {r['accuracy']:.1%} vs prev-best {_fmt_pct(r['prev_best_accuracy'])} "
+              f"(threshold {_fmt_pct(r['threshold'])}) -> {marker}")
+    if report["early_stop"] is not None:
+        print(f"  early stop at round {report['early_stop']['round']} "
+              f"({report['early_stop']['rounds_skipped']} round(s) of max_rounds skipped)")
+    print(f"  chunk {report['chunk']} ends with: round {report['rounds_run']}'s decision "
+          f"-> final accuracy {_fmt_pct(report['final_accuracy'])}, streak {report['streak']}")
+
+
+def print_chunk_score_detail(chunk_number, chunk_result):
+    """
+    Per-candidate accuracy detail (exact-match, changed-cell accuracy,
+    by-action breakdown) for the chunk's final code, via the EXISTING
+    summarize_scores/print_score_summary (no new mechanism needed for this)
+    — fed chunk_result["current_best_scored"] directly, so the candidate is
+    never re-run just to produce this report.
+    """
+    scored = chunk_result.get("current_best_scored")
+    if not scored:
+        return
+    print_score_summary(summarize_scores(scored), label=f"chunk {chunk_number} final")
+
+
+def report_chunk(chunk_number, prev_boundary, boundary, chunk_result, max_rounds):
+    """
+    Convenience wrapper: everything the outer per-chunk loop
+    (cmd_run_chunked) needs to call once a chunk finishes, in the right
+    order — event-by-event log lines, then the structured chunk summary,
+    then per-candidate score detail for the chunk's final code.
+    """
+    log_chunk_events(chunk_number, chunk_result)
+    print_chunk_report(build_chunk_report(chunk_number, prev_boundary, boundary, chunk_result, max_rounds))
+    print_chunk_score_detail(chunk_number, chunk_result)
+
+
+def update_running_best_accuracy(running_best, chunk_final_accuracy):
+    """
+    Running best-chunk-ending-accuracy-so-far across the whole run — read-
+    only bookkeeping, updated once per chunk with that chunk's OWN final
+    accuracy (never a mid-chunk round's accuracy, and never a rejected
+    candidate's). Never fed back into the epsilon-reset comparison in any
+    way — this exists purely so end-of-run reporting can show whether the
+    final candidate ended up worse than some earlier chunk's peak, which
+    the epsilon-reset scheme explicitly allows to happen (a later chunk's
+    code only ever has to stay within epsilon of the round immediately
+    before it, not of the run's all-time best).
+    """
+    if running_best is None or chunk_final_accuracy > running_best:
+        return chunk_final_accuracy
+    return running_best
+
+
+def print_run_summary(running_best_accuracy, final_accuracy, n_chunks):
+    """
+    End-of-run summary: the run's best chunk-ending accuracy printed
+    alongside the final candidate's own accuracy, so accumulated drift from
+    the epsilon-reset scheme is visible at a glance without reconstructing
+    it from the full per-chunk log.
+    """
+    print(f"\n=== Run summary: {n_chunks} chunk(s) ===")
+    print(f"  best chunk-ending accuracy seen during the run: {_fmt_pct(running_best_accuracy)}")
+    print(f"  final candidate's accuracy: {_fmt_pct(final_accuracy)}")
+    if (running_best_accuracy is not None and final_accuracy is not None
+            and final_accuracy < running_best_accuracy - 1e-9):
+        print(f"  NOTE: final candidate is {(running_best_accuracy - final_accuracy):.1%} points BELOW "
+              f"the best chunk-ending accuracy seen during the run — the best-performing code seen so "
+              f"far was from an earlier chunk, not the final one. This is a legitimate outcome of the "
+              f"epsilon-reset scheme: a later chunk's code only ever has to stay within epsilon of the "
+              f"round immediately before it, never of the run's all-time best — worth knowing about, "
+              f"not necessarily a bug.")
+
+
 # ---------- subcommands ----------
 
 def cmd_inspect(args):
@@ -1147,10 +1522,10 @@ def cmd_preprocess(args):
     levels_completed_after on the cleaned record. A single row's own before/
     after pair is what next_level_completion_row (chunk boundary computation)
     and is_goal certification both key off of — goal_reached is exactly
-    levels_completed_after > levels_completed_before for that same row, per
-    design doc §1/§9. Non-fatal if a trace doesn't carry this field (same
-    lenient, best-effort treatment as --score-key below) — pass --levels-key ""
-    to skip the attempt entirely.
+    levels_completed_after > levels_completed_before for that same row.
+    Non-fatal if a trace doesn't carry this field (same lenient,
+    best-effort treatment as --score-key below) — pass --levels-key "" to
+    skip the attempt entirely.
     """
     in_path = Path(args.trace)
     out_path = Path(args.out)
@@ -1195,23 +1570,6 @@ def cmd_preprocess(args):
     print(f"Wrote {n} cleaned records to {out_path}")
 
 
-def cmd_split(args):
-    with open(args.trace) as f:
-        records = [json.loads(l) for l in f if l.strip()]
-    n = len(records)
-    if args.shuffle:
-        import random
-        rng = random.Random(args.seed)
-        records = records[:]  # copy so the input list order isn't mutated in place
-        rng.shuffle(records)
-    split_idx = int(n * args.history_frac)
-    history, held_out = records[:split_idx], records[split_idx:]
-    Path(args.history_out).write_text("\n".join(json.dumps(r) for r in history) + "\n")
-    Path(args.heldout_out).write_text("\n".join(json.dumps(r) for r in held_out) + "\n")
-    print(f"{n} records -> history={len(history)} ({args.history_out}), "
-          f"held_out={len(held_out)} ({args.heldout_out})")
-
-
 ENCODING_EXPLANATION_HEX = """IMPORTANT — display format vs. real data: grids below are shown as one row per line, \
 one character per cell, as a compact display shorthand only. Each character is a \
 single hexadecimal digit standing in for one integer color value 0-15 (0-9 mean \
@@ -1248,10 +1606,10 @@ DESCRIPTION_INSTRUCTION_TRAILER = (
 
 def build_description_instruction(is_extend=False, is_level_boundary=False):
     """
-    Object-description instruction shown in PROMPT_TEMPLATE/EXTEND_TEMPLATE — never
-    REVISE_TEMPLATE (design doc §4: revision is deliberately scoped tightly to
-    specific failing rows; the model can update DESCRIPTION opportunistically as
-    part of a normal revision without a separately mandated step there).
+    Object-description instruction shown in PROMPT_TEMPLATE/EXTEND_TEMPLATE
+    — never REVISE_TEMPLATE (revision is deliberately scoped tightly to
+    specific failing rows; the model can update DESCRIPTION opportunistically
+    as part of a normal revision without a separately mandated step there).
 
     PROMPT_TEMPLATE (chunk 1, is_extend=False) gets the 3-step version — there's no
     prior description to consult yet. EXTEND_TEMPLATE (every chunk after the first,
@@ -1261,13 +1619,14 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
 
     When this EXTEND_TEMPLATE call is for the chunk that starts right after a level
     completion (is_level_boundary=True — this is the LAGGED value from the
-    PREVIOUS chunk's next_chunk_boundary call, per that function's own docstring
-    and Step 10's one-chunk-lag wiring, never the current chunk's own), an extra,
-    stronger sentence is prepended telling the model explicitly that a new level
-    just started and its persisted DESCRIPTION may no longer apply — stronger than
-    the routine "may already be sufficient, or it may need revising" step 1 language
-    every other EXTEND_TEMPLATE chunk gets, since a new level can introduce a whole
-    new tileset the existing description never accounted for.
+    PREVIOUS chunk's next_chunk_boundary call, per that function's own docstring;
+    the caller carries it forward one chunk, never using the current chunk's own
+    value), an extra, stronger sentence is prepended telling the model explicitly
+    that a new level just started and its persisted DESCRIPTION may no longer
+    apply — stronger than the routine "may already be sufficient, or it may need
+    revising" step 1 language every other EXTEND_TEMPLATE chunk gets, since a new
+    level can introduce a whole new tileset the existing description never
+    accounted for.
     """
     if not is_extend:
         steps = (
@@ -1418,8 +1777,8 @@ display notation used above to show you the examples.
 Write your updated GameModel class now.
 """
 
-REVISE_TEMPLATE = """Your previous candidate for predict_next_state got some transitions wrong. \
-Here is the current code:
+REVISE_TEMPLATE = """Your current GameModel class got some transitions wrong. Here is the \
+current class:
 
 ```python
 {candidate_code}
@@ -1427,51 +1786,68 @@ Here is the current code:
 
 {encoding_explanation}
 
-Each counterexample below includes computed diffs — exactly which cells actually \
-changed, and exactly which cells your prediction changed instead — in real integer \
-(row, col): before -> after form. Use those directly to see where your rule diverges \
-from the truth; you do not need to manually compare grids cell-by-cell yourself.
-
-It produced the WRONG grid_after for the following examples:
+{status_notes}
+Each counterexample below shows a row your class has been failing on, comparing your \
+predicted grid_after (when your class produced one) to the correct grid_after, with a \
+computed diff between them — exactly which cells differ, and the correct value vs. \
+what you predicted — in real integer (row, col): your prediction -> correct value \
+form. Use that directly to see where your rule diverges from the truth; you do not \
+need to manually compare grids cell-by-cell yourself. These rows are selected because \
+your class has failed on them most persistently across the WHOLE trace so far, not \
+just the newest rows it's seen:
 
 {counterexamples}
 
-Revise the function so it correctly handles these cases while continuing to handle \
-the cases it already gets right. Use only the Python standard library. Return only \
-the corrected function definition, no explanation.
+Revise your GameModel class so it correctly handles these cases while continuing to \
+handle the cases it already gets right, WITHOUT rewriting it from scratch. Your \
+predict method must keep this exact signature:
 
-Define predict_next_state exactly ONCE. Do not write multiple draft attempts or \
-alternate versions — revise your single best hypothesis and write one complete, \
-syntactically valid function. Every if/elif/else branch and loop body must contain a \
-real statement — never leave a branch with only a comment inside it.
+    def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+        ...
 
-State your revised hypothesis ONCE, briefly, as a short comment. Do not re-examine \
-the same counterexamples repeatedly or restate your reasoning multiple times — write \
-your best fix and move on, even if it's imperfect. You'll get another revision round \
-if it's still wrong.
+returning (predicted_grid_after, goal, state) exactly as before — see your class's own \
+docstring above for what each element means if you need a reminder. grid_before is \
+always a list of lists of plain integers 0-15 — never the compact display notation \
+shown above, whichever form it takes — and predicted_grid_after must be in that same \
+form. Use only the Python standard library or numpy — no other third-party packages. \
+Return only the full, updated class definition, no explanation, no example usage.
 
-Reminder: predict_next_state takes and returns plain Python int grids at runtime, \
-never the display notation used above to show you the examples.
+Define GameModel exactly ONCE, and define each of its methods exactly ONCE — revise or \
+adjust the existing methods/fields shown above rather than writing multiple draft \
+attempts, "actually, let me try again" rewrites, or alternate versions of the whole \
+class. Every if/elif/else branch and every loop body must contain a real statement \
+(return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
+
+State what you changed, if anything, ONCE, briefly, as a short comment. Do not \
+re-examine the same counterexamples repeatedly or restate your reasoning multiple \
+times — write your best fix and move on, even if it's imperfect. You'll get another \
+revision round later if something is still wrong.
+
+Reminder: predict() takes and returns plain Python int grids at runtime, never the \
+display notation used above to show you the examples.
+
+Write your updated GameModel class now.
 """
 
 
 def build_examples_block(records, encoding="hex", is_extend=False):
     """
     Render a contiguous batch of records as one continuous replay, not
-    independent snapshots (design doc §4): the full encoded grid is shown
-    exactly once (`Starting Grid`), and every subsequent example is shown
-    only as a diff against the immediately preceding one — a full grid for
-    every example is redundant, since each subsequent starting grid is just
-    the previous example's resulting grid, already fully implied by the
-    previous example's diff.
+    independent snapshots: the full encoded grid is shown exactly once
+    (`Starting Grid`), and every subsequent example is shown only as a diff
+    against the immediately preceding one — a full grid for every example
+    is redundant, since each subsequent starting grid is just the previous
+    example's resulting grid, already fully implied by the previous
+    example's diff.
 
     `is_extend` controls only the one extra "not the game's start" sentence
     (PROMPT_TEMPLATE calls with is_extend=False, EXTEND_TEMPLATE with
     is_extend=True) — everything else is shared. This function backs the
-    round-1/extend path only; build_counterexamples_block (REVISE_TEMPLATE)
-    is unchanged and continues showing full predicted/actual grid pairs per
-    counterexample, since a counterexample's whole purpose is the
-    predicted-vs-actual comparison, not a contiguous replay.
+    round-1/extend path only; REVISE_TEMPLATE's counterexample rendering
+    (build_row_counterexamples_block) is unrelated and continues showing
+    full predicted/actual grid pairs per counterexample, since a
+    counterexample's whole purpose is the predicted-vs-actual comparison,
+    not a contiguous replay.
 
     Precondition: `records` must be genuinely contiguous —
     records[i]["grid_before"] == records[i-1]["grid_after"] for every i > 0
@@ -1522,31 +1898,12 @@ def build_examples_block(records, encoding="hex", is_extend=False):
     return "\n".join(lines)
 
 
-def spread_sample(records, max_examples):
-    """
-    Evenly-spaced subsample across the whole list (not just the first N).
-
-    SUPERSEDED for round-1 prompt building under the chunked curriculum
-    (design doc §2) — build_initial_prompt now takes chunk 1 as the trace's
-    first max_examples rows in chronological order instead, since
-    build_examples_block's contiguity precondition requires it (an
-    evenly-spaced sample isn't contiguous and would trip that assertion).
-    Left defined, unused by build_initial_prompt, only in case any other
-    legacy caller still depends on the old flat-harness sampling behavior.
-    """
-    if not max_examples or len(records) <= max_examples:
-        return records
-    step = len(records) / max_examples
-    idxs = sorted(set(int(i * step) for i in range(max_examples)))
-    return [records[i] for i in idxs]
-
-
 def build_initial_prompt(records, max_examples, encoding="hex"):
     """
-    Chunk 1's round-1 prompt. Under the chunked curriculum (design doc §2),
-    chunk 1 is simply the trace's first max_examples rows in chronological
-    order — see spread_sample's docstring for why this is no longer an
-    evenly-spaced subsample across the whole trace.
+    Chunk 1's round-1 prompt. Under the chunked curriculum, chunk 1 is
+    simply the trace's first max_examples rows in chronological order —
+    contiguous, not an evenly-spaced subsample across the whole trace,
+    since build_examples_block's contiguity precondition requires it.
     """
     sampled = records[:max_examples]
     prompt = PROMPT_TEMPLATE.format(
@@ -1559,14 +1916,14 @@ def build_initial_prompt(records, max_examples, encoding="hex"):
 
 def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_boundary=False):
     """
-    Round-1 prompt for every chunk after the first (design doc §4). Shows
-    the candidate's current class in full plus only this chunk's newly
-    introduced rows — not the whole trace-so-far, which would defeat the
-    point of a bounded per-chunk prompt.
+    Round-1 prompt for every chunk after the first. Shows the candidate's
+    current class in full plus only this chunk's newly introduced rows —
+    not the whole trace-so-far, which would defeat the point of a bounded
+    per-chunk prompt.
 
     is_level_boundary must be the LAGGED value from the PREVIOUS chunk's
-    next_chunk_boundary call (Step 4/Step 10's one-chunk lag), never this
-    chunk's own not-yet-relevant is_level_boundary — see
+    next_chunk_boundary call (the caller carries it forward one chunk),
+    never this chunk's own not-yet-relevant is_level_boundary — see
     build_description_instruction's docstring for why.
     """
     return EXTEND_TEMPLATE.format(
@@ -1579,38 +1936,216 @@ def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_bo
     )
 
 
-def build_counterexamples_block(counterexamples, encoding="hex"):
-    """Format failing records, showing what was predicted vs. what actually happened."""
-    blocks = []
-    for i, rec in enumerate(counterexamples):
-        pred = rec.get("prediction")
-        actual_changes = diff_grid(rec["grid_before"], rec["grid_after"])
-        if pred is not None:
-            pred_str = encode_grid(pred, encoding)
-            pred_changes = diff_grid(rec["grid_before"], pred)
-            pred_diff_str = format_diff(pred_changes)
-        else:
-            pred_str = f"(error: {rec.get('error')})"
-            pred_diff_str = "(candidate raised an error — see above — so no predicted grid to diff)"
-        blocks.append(
-            f"### Counterexample {i + 1}\n"
-            f"action: {rec['action']}\n"
-            f"grid_before:\n{encode_grid(rec['grid_before'], encoding)}\n"
-            f"your prediction:\n{pred_str}\n"
-            f"correct grid_after:\n{encode_grid(rec['grid_after'], encoding)}\n"
-            f"what actually changed (grid_before -> correct grid_after), computed for "
-            f"you — real int values:\n{format_diff(actual_changes)}\n"
-            f"what your prediction changed instead (grid_before -> your prediction):\n"
-            f"{pred_diff_str}\n"
+def select_top_k_failures(row_failure_counts, k):
+    """
+    Plain top-k selection by failure count from the persistent
+    row_failure_counts.json record — not a bounded-diversity round-robin-
+    by-action selection. Selection here always draws from the full
+    trace-so-far, not just the current chunk's newly introduced rows.
+
+    Only rows with count > 0 are eligible — a row at count 0 is currently
+    passing (or has never been scored as failing) and is never shown in a
+    revision prompt.
+
+    Tie-break, precisely: row_failure_counts.json's key order is the order
+    rows were FIRST scored, which is always ascending trace/step order
+    (every backtest replay covers 0..boundary in order, and boundary only
+    ever grows chunk to chunk, so a row's insertion position never changes
+    once set). When the failure-count group straddling the k-th slot has
+    more members than the remaining slots, members are kept in that
+    ascending file order and dropped from the END of the tied group until
+    it fits exactly. Worked example: k=10, 6 rows at count=5, 5 rows at
+    count=4 -> all 6 count-5 rows, plus the first 4 (file order) of the 5
+    count-4 rows; the 5th (last in file order) count-4 row is dropped.
+
+    Returns a list of (step_key, entry) tuples, longest-failing first, at
+    most k long.
+    """
+    order_index = {step_key: i for i, step_key in enumerate(row_failure_counts.keys())}
+    eligible = [
+        (step_key, entry) for step_key, entry in row_failure_counts.items()
+        if entry.get("count", 0) > 0
+    ]
+    eligible.sort(key=lambda kv: (-kv[1]["count"], order_index[kv[0]]))
+    return eligible[:k]
+
+
+def build_revise_status_notes(most_recent_passed):
+    """
+    The "state of play" sentence REVISE_TEMPLATE wants up front, before the
+    counterexamples themselves: whether the single most recent (highest-
+    step) row of the current row range was predicted correctly or not.
+
+    Note: an earlier version of this also surfaced a note when the epsilon
+    check rejected the immediately preceding round's candidate ("this
+    round is built from an earlier round's code, not the one you just
+    wrote"). That's been dropped — each revision call is a fresh, stateless
+    LLM call with no memory of prior rounds, so telling the model "the
+    previous round was rejected" gives it nothing actionable; it has no
+    visibility into what that rejected candidate looked like or why it
+    differs from the code shown here. The rejection itself is still logged
+    (log_substitution), just not surfaced inside the prompt.
+
+    Returns "" when most_recent_passed is None (row_failure_counts empty).
+    """
+    if most_recent_passed is None:
+        return ""
+    return (
+        "The single most recent row of the current row range was predicted "
+        + ("CORRECTLY." if most_recent_passed else "INCORRECTLY.")
+        + "\n"
+    )
+
+
+def build_revise_row_block(i, step_key, entry, encoding="hex"):
+    """
+    Render one selected row_failure_counts.json entry as a counterexample.
+    Built entirely from the entry's own fields — count, actual_grid/
+    actual_goal (ground truth), predicted_grid/predicted_goal/error (most
+    recent attempt) — no grid_before/action are available in this schema,
+    so the diff shown here is between the predicted grid and the correct
+    grid directly, not a before/after transition diff.
+
+    Three distinct cases:
+      - False-positive goal (predicted_goal=True, actual_goal=False):
+        actual_grid is a normal same-level continuation, shown as usual,
+        plus an explicit note that the goal prediction was wrong.
+      - False-negative goal (predicted_goal=False, actual_goal=True): the
+        grid diff is omitted entirely — actual_grid here is the NEXT
+        level's starting grid, not a comparable continuation — and the row
+        is labeled as a missed level-completion transition rather than an
+        ordinary wrong-transition row.
+      - Ordinary wrong-transition row (goal correctly predicted False, grid
+        wrong): predicted vs. correct grid, with a computed diff.
+    A row that crashed/timed out (error is not None) is called out
+    separately regardless of which of the above it would otherwise be.
+    """
+    count = entry.get("count", 0)
+    actual_grid = entry["actual_grid"]
+    actual_goal = entry["actual_goal"]
+    predicted_grid = entry.get("predicted_grid")
+    predicted_goal = entry.get("predicted_goal")
+    error = entry.get("error")
+
+    header = f"### Counterexample {i} (trace step {step_key}, failed {count}x so far)\n"
+
+    if error is not None:
+        return (
+            header
+            + f"Your class raised an error or timed out on this row instead of "
+              f"returning a prediction: {error}\n"
+              f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n"
         )
-    return "\n".join(blocks)
+
+    if predicted_goal and not actual_goal:
+        pred_str = encode_grid(predicted_grid, encoding) if predicted_grid is not None else "(no grid predicted)"
+        diff = diff_grid(predicted_grid, actual_grid) if predicted_grid is not None else []
+        return (
+            header
+            + "FALSE-POSITIVE goal prediction: you predicted goal=True (level complete) "
+              "on this row, but the level did NOT actually complete here.\n"
+            + f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n"
+              f"your predicted grid_after:\n{pred_str}\n"
+              f"cells where your prediction differs from the correct grid, real int "
+              f"values (your prediction -> correct):\n{format_diff(diff)}\n"
+        )
+
+    if (not predicted_goal) and actual_goal:
+        return (
+            header
+            + "MISSED LEVEL-COMPLETION TRANSITION: you predicted goal=False on this "
+              "row, but the level actually completed here. The correct grid_after for "
+              "this row is the NEXT level's starting grid, not a continuation of the "
+              "current one, so no cell-by-cell grid diff is shown — focus on detecting "
+              "that this action completes the level, not on matching the resulting "
+              "grid.\n"
+        )
+
+    # Ordinary wrong-transition row: goal correctly predicted False, grid wrong.
+    pred_str = encode_grid(predicted_grid, encoding) if predicted_grid is not None else "(no grid predicted)"
+    diff = diff_grid(predicted_grid, actual_grid) if predicted_grid is not None else []
+    return (
+        header
+        + f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n"
+          f"your predicted grid_after:\n{pred_str}\n"
+          f"cells where your prediction differs from the correct grid, real int values "
+          f"(your prediction -> correct):\n{format_diff(diff)}\n"
+    )
 
 
-def build_revise_prompt(candidate_code, counterexamples, encoding="hex"):
+def build_row_counterexamples_block(selected, encoding="hex"):
+    """Render a top-k selection (select_top_k_failures) as REVISE_TEMPLATE's {counterexamples} block."""
+    return "\n".join(
+        build_revise_row_block(i, step_key, entry, encoding=encoding)
+        for i, (step_key, entry) in enumerate(selected, start=1)
+    )
+
+
+def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"):
+    """
+    Revision-round prompt builder for the chunked design — takes a
+    persistent row_failure_counts.json record rather than a pre-selected
+    counterexamples list keyed on grid_before/action. Counterexamples are
+    selected via plain top-k failure count directly from that record,
+    covering the entire trace-so-far, not just the current chunk's newly
+    introduced rows — see select_top_k_failures for the exact tie-break
+    rule.
+
+    row_failure_counts must already reflect whichever code is genuinely
+    current-best for this chunk — i.e. the per-chunk round loop's
+    commit/revert has already run for any prior round in this chunk. This
+    function trusts the dict handed to it and does no commit/revert
+    bookkeeping of its own.
+
+    Two distinct "not enough rows" situations, handled differently on
+    purpose:
+      - k > len(row_failure_counts) (asking for more counterexamples than
+        rows have EVER been scored, period) is a caller misconfiguration —
+        there is no way this could ever be satisfiable at this point in the
+        run, so this raises immediately rather than silently proceeding
+        with a much smaller k than intended.
+      - Fewer than k rows are CURRENTLY FAILING (e.g. k=10 but only 6 rows
+        have count > 0) is completely normal and expected as a candidate
+        improves — select_top_k_failures simply returns however many
+        failing rows exist (via a plain list slice, which is a no-op if
+        the list is already shorter than k). This must NOT raise.
+    """
+    total_rows = len(row_failure_counts)
+    if k > total_rows:
+        raise ValueError(
+            f"k={k} exceeds the total number of rows currently tracked in "
+            f"row_failure_counts ({total_rows}) — there can never be more than "
+            f"{total_rows} counterexamples to select from at this point in the run. "
+            f"This usually means --k was set larger than intended for the current "
+            f"chunk/trace size; lower k, or wait until more rows have been backtested."
+        )
+
+    selected = select_top_k_failures(row_failure_counts, k)
+    if not selected:
+        # The zero-failure early stop in the per-chunk round loop is
+        # specifically designed to make this unreachable — a chunk with
+        # zero failing rows should never reach a revision round at all.
+        # Fail loudly rather than silently building a prompt with no
+        # counterexamples. Distinct from the k > total_rows case above:
+        # this can fire even when k is perfectly reasonable, if every
+        # tracked row currently has count 0.
+        raise ValueError(
+            "build_revise_prompt called with no failing rows in row_failure_counts — "
+            "this should be unreachable; the zero-failure early stop in the per-chunk "
+            "round loop is supposed to prevent a revision round from ever being built here."
+        )
+
+    most_recent_step = next(reversed(row_failure_counts), None)
+    most_recent_passed = (
+        row_failure_counts[most_recent_step]["count"] == 0
+        if most_recent_step is not None else None
+    )
+
     return REVISE_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
         encoding_explanation=encoding_explanation(encoding),
-        counterexamples=build_counterexamples_block(counterexamples, encoding=encoding),
+        status_notes=build_revise_status_notes(most_recent_passed),
+        counterexamples=build_row_counterexamples_block(selected, encoding=encoding),
     )
 
 
@@ -1624,7 +2159,7 @@ def estimate_tokens_fallback(text):
     (confirmed against a live tokenizer: a 43,090-char grid-heavy prompt came
     out to 41,493 real tokens, not the ~10,772 the old chars//4 estimate
     gave). This is still just a ballpark — prefer a real tokenizer (see
-    run-loop's preflight check) whenever one is available.
+    run-chunked's preflight check) whenever one is available.
     """
     return len(text)
 
@@ -1644,7 +2179,7 @@ def extract_code(text):
     return m.group(1).strip() if m else text.strip()
 
 
-def keep_first_function_def(source, class_name="GameModel"):
+def keep_first_class_def(source, class_name="GameModel"):
     """
     Generalized from an earlier single-function version to work against the
     class-based candidate contract (a top-level `class GameModel: ...` with
@@ -1866,29 +2401,46 @@ def cmd_prompt(args):
 
 
 def cmd_revise_prompt(args):
+    """
+    Manual test/inspection entry point for build_revise_prompt. Reads
+    row_failure_counts.json (as written by `backtest`, or a hand-
+    constructed fixture for testing) rather than a counterexamples jsonl —
+    see build_revise_prompt's docstring for why the older counterexamples-
+    list contract no longer applies here.
+    """
     candidate_code = Path(args.candidate).read_text()
-    with open(args.counterexamples) as f:
-        counterexamples = [json.loads(l) for l in f if l.strip()]
+    row_failure_counts = load_row_failure_counts(args.counts)
     encoding = "rle" if args.compact else "hex"
-    prompt = build_revise_prompt(candidate_code, counterexamples, encoding=encoding)
+    try:
+        prompt = build_revise_prompt(candidate_code, row_failure_counts, k=args.k, encoding=encoding)
+    except ValueError as e:
+        # Covers both of build_revise_prompt's validation failures: --k
+        # larger than the total number of rows ever tracked (misconfigured
+        # --k for this trace/chunk size), and zero currently-failing rows
+        # (should be unreachable once the per-chunk round loop's zero-
+        # failure early stop is wired in, but easy to hit here when
+        # hand-testing against a clean fixture).
+        print(f"Could not build revision prompt: {e}")
+        sys.exit(1)
     Path(args.out).write_text(prompt)
     est_tokens = estimate_tokens_fallback(prompt)
+    n_selected = len(select_top_k_failures(row_failure_counts, args.k))
     print(f"Wrote revision prompt to {args.out}: {len(prompt)} chars, ~{est_tokens} tokens "
           f"(rough 1-token/char fallback estimate — no tokenizer loaded on this path), "
-          f"{len(counterexamples)} counterexamples"
+          f"{n_selected} counterexamples (top-{args.k} by failure count)"
           + (" [RLE-compact grid encoding]" if args.compact else " [hex grid encoding]"))
 
 
 def cmd_backtest(args):
     """
     Standalone CLI wrapper around run_backtest, mainly for manual testing/
-    debugging outside the full chunked run-loop (Step 10 wires run_backtest
-    directly into that loop without going through this command).
+    debugging outside the full run-chunked pipeline (cmd_run_chunked wires
+    run_backtest directly into that loop without going through this
+    command).
 
     Exit 0 if the replay is fully clean (zero failing rows), exit 1
-    otherwise. This is a simpler convention than the older evaluate
-    command's 0/1/2 — there's no fixed accuracy threshold to check here;
-    per-chunk accept/reject against a baseline is Step 8's epsilon
+    otherwise. There's no fixed accuracy threshold to check here; per-chunk
+    accept/reject against a baseline is the per-chunk round loop's epsilon
     comparison, not this command's job.
     """
     with open(args.trace) as f:
@@ -1917,253 +2469,223 @@ def cmd_backtest(args):
     sys.exit(0)
 
 
-def cmd_score(args):
-    with open(args.dataset) as f:
-        records = [json.loads(l) for l in f if l.strip()]
-    scored, accuracy = score_candidate(
-        args.candidate, records,
-        cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
-        per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout,
-    )
-    if args.out:
-        Path(args.out).write_text("\n".join(json.dumps(s) for s in scored) + "\n")
-        print(f"Wrote per-record results to {args.out}")
-    n_pass = sum(1 for s in scored if s["passed"])
-    print(f"{args.candidate} vs {args.dataset}: {n_pass}/{len(scored)} passed ({accuracy:.1%})")
-    print_score_summary(summarize_scores(scored), label=str(args.dataset))
+# ---------- run-chunked ----------
+# Loads the full trace once, chronologically, and drives the chunked-
+# curriculum outer loop (boundaries computed by next_chunk_boundary) with
+# an inner extend/revise round loop per chunk (run_chunk_rounds' epsilon-
+# reset selection).
+
+FALLBACK_CANDIDATE_CODE = '''class GameModel:
+    """Safe no-op stub substituted in when this round's LLM output could not
+    be validated as safe code (SyntaxError or a disallowed import) -- see
+    _validate_candidate_code. Always predicts no change and no goal, so it
+    scores low but never crashes the sandboxed backtest."""
+    def predict(self, grid_before, action, previous_state):
+        return grid_before, False, previous_state
+'''
 
 
-def cmd_evaluate(args):
+def _validate_candidate_code(code, round_label):
     """
-    The stop condition for the verify-and-revise loop. Scores the candidate
-    against held-out ONLY — held-out never gets used to pick counterexamples,
-    so its accuracy stays a clean signal of whether the architecture actually
-    generalizes, not just fits what it's already seen. Decides:
-      - exit 0: STOP, threshold met
-      - exit 2: STOP, max rounds reached without meeting threshold
-      - exit 1: CONTINUE — and if --history/--counterexamples-out are given,
-                writes the next round's counterexamples from history failures
+    Best-effort preflight validation of this round's extracted candidate
+    code, run BEFORE it ever reaches run_chunk_rounds -> run_backtest ->
+    run_candidate -- none of which have (or need) their own defensive
+    handling for genuinely malformed code, since up to now every caller
+    controlled its own test fixtures. Real LLM output is exactly the case
+    that needs this: a truncated generation (SyntaxError) or a disallowed
+    import (ValueError from check_ast_imports) would otherwise propagate
+    up through run_chunk_rounds uncaught and crash the entire multi-chunk
+    run over one bad round. Both are substituted with FALLBACK_CANDIDATE_CODE
+    instead -- a real, always-parseable, always-safe class that just scores
+    low rather than crashing anything.
+
+    Deliberately does NOT catch RuntimeError/OSError here (an actual
+    subprocess/sandbox infrastructure failure, as opposed to a bad
+    candidate) -- those still propagate and halt the run, since silently
+    absorbing an infra problem into a fake low-accuracy round would hide
+    something that actually needs attention during a real GPU run.
     """
-    with open(args.heldout) as f:
-        heldout_records = [json.loads(l) for l in f if l.strip()]
-
-    scored, accuracy = score_candidate(
-        args.candidate, heldout_records,
-        cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
-        per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout,
-    )
-    n_pass = sum(1 for s in scored if s["passed"])
-    summary = summarize_scores(scored)
-
-    log_entry = {
-        "round": args.round,
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "candidate": str(args.candidate),
-        "heldout_accuracy": accuracy,
-        "n_passed": n_pass,
-        "n_total": len(scored),
-        "heldout_mean_cell_accuracy": summary["mean_cell_accuracy"],
-        "heldout_mean_changed_cell_accuracy": summary["mean_changed_cell_accuracy"],
-        "heldout_n_dynamic_records": summary["n_dynamic_records"],
-        "heldout_by_action": summary["by_action"],
-    }
-    if args.log:
-        with open(args.log, "a") as f:
-            f.write(json.dumps(log_entry) + "\n")
-
-    print(f"Round {args.round}: held-out accuracy {accuracy:.1%} ({n_pass}/{len(scored)}), "
-          f"threshold {args.threshold:.1%}")
-    print_score_summary(summary, label="held-out")
-
-    if accuracy >= args.threshold:
-        print(f"STOP: threshold met at round {args.round}.")
-        sys.exit(0)
-
-    if args.round >= args.max_rounds:
-        print(f"STOP: reached max rounds ({args.max_rounds}) without meeting threshold.")
-        sys.exit(2)
-
-    print(f"CONTINUE: threshold not met, {args.max_rounds - args.round} round(s) remain.")
-
-    if args.history and args.counterexamples_out:
-        with open(args.history) as f:
-            history_records = [json.loads(l) for l in f if l.strip()]
-        hist_scored, hist_accuracy = score_candidate(
-            args.candidate, history_records,
-            cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
-            per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout,
-        )
-        failures = [s for s in hist_scored if not s["passed"]]
-        chosen = select_counterexamples(failures, args.k)
-        Path(args.counterexamples_out).write_text("\n".join(json.dumps(c) for c in chosen) + "\n")
-        n_hist_pass = len(history_records) - len(failures)
-        print(f"History accuracy {hist_accuracy:.1%} ({n_hist_pass}/{len(history_records)}). "
-              f"Wrote {len(chosen)} counterexamples to {args.counterexamples_out} for the next revision prompt.")
-    elif args.history or args.counterexamples_out:
-        print("Note: both --history and --counterexamples-out are needed to write next-round "
-              "counterexamples; skipping since only one was given.")
-
-    sys.exit(1)
+    try:
+        import ast as _ast
+        _ast.parse(code)
+        check_ast_imports(code)
+        return code
+    except (SyntaxError, ValueError) as e:
+        print(f"{round_label}: candidate failed validation ({type(e).__name__}: {e}); "
+              f"substituting a safe no-op stub for this round so the run doesn't crash")
+        return FALLBACK_CANDIDATE_CODE
 
 
-def cmd_run_loop(args):
+def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_boundary,
+                        records, counts_path, workdir, llm_call, tokenize, encoding, args, run_state):
     """
-    Fully automated verify-and-revise loop: builds the prompt, calls the LLM
-    over its OpenAI-compatible API, scores the reply, and repeats — no manual
-    copy-paste. Each round's prompt and candidate are written to --workdir so
-    you can inspect exactly what was sent/produced if something looks off.
+    Builds the round_builder(round_n, current_best_code) -> candidate_code
+    callback run_chunk_rounds expects, closing over everything one chunk's
+    worth of rounds needs: which template to build (PROMPT_TEMPLATE for
+    chunk 1's round 1, EXTEND_TEMPLATE for round 1 of every later chunk
+    using the LAGGED is_level_boundary, REVISE_TEMPLATE — reading
+    row_failure_counts.json fresh each time, since run_chunk_rounds already
+    keeps counts_path in lockstep with current_best_code between rounds —
+    for every round after), the live LLM call, code extraction/trimming,
+    and per-round prompt/candidate files under --workdir for inspection.
+
+    run_state is a small shared mutable dict — currently just
+    {"interrupted": bool} — used to carry a Ctrl+C signal out to the outer
+    per-chunk loop. NOTE on interrupt granularity: this stops the run
+    before the NEXT CHUNK starts, not before the next round within the
+    SAME chunk — a deliberate simplification, since run_chunk_rounds has no
+    hook for signaling early termination mid-round-loop without modifying
+    that already-tested function. In practice this means, worst case,
+    up to (max_rounds - 1) more LLM calls complete before the run actually
+    stops after a Ctrl+C.
     """
-    workdir = Path(args.workdir)
-    workdir.mkdir(parents=True, exist_ok=True)
-
-    with open(args.history) as f:
-        history_records = [json.loads(l) for l in f if l.strip()]
-    with open(args.heldout) as f:
-        heldout_records = [json.loads(l) for l in f if l.strip()]
-
-    run_kwargs = dict(cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
-                       per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout)
-
-    llm_call, tokenize = build_llm_caller(args)  # loads the GGUF once here for --backend llama-cpp
-    encoding = "rle" if args.compact else "hex"
-
-    counterexamples = None
-    for round_n in range(1, args.max_rounds + 1):
-        if counterexamples is None:
-            prompt_text, n_used = build_initial_prompt(history_records, args.max_examples, encoding=encoding)
-            print(f"Round {round_n}: seed prompt with {n_used} examples")
-            round_label = f"Round {round_n}: Prompt"
+    def round_builder(round_n, current_best_code):
+        if round_n == 1:
+            if chunk_number == 1:
+                prompt_text, _ = build_initial_prompt(records, boundary, encoding=encoding)
+                round_label = f"Chunk {chunk_number} Round {round_n}: Seed Prompt"
+            else:
+                new_records = records[prev_boundary:boundary]
+                prompt_text = build_extend_prompt(
+                    current_best_code, new_records, encoding=encoding,
+                    is_level_boundary=lagged_level_boundary,
+                )
+                round_label = f"Chunk {chunk_number} Round {round_n}: Extend Prompt"
         else:
-            prev_candidate_code = Path(workdir / f"candidate_round{round_n - 1}.py").read_text()
-            prompt_text = build_revise_prompt(prev_candidate_code, counterexamples, encoding=encoding)
-            print(f"Round {round_n}: revision prompt with {len(counterexamples)} counterexamples")
-            round_label = f"Round {round_n}: Revision Prompt"
+            row_failure_counts = load_row_failure_counts(counts_path)
+            prompt_text = build_revise_prompt(current_best_code, row_failure_counts, k=args.k, encoding=encoding)
+            round_label = f"Chunk {chunk_number} Round {round_n}: Revision Prompt"
 
-        prompt_path = workdir / f"prompt_round{round_n}.txt"
+        prompt_path = workdir / f"chunk{chunk_number}_prompt_round{round_n}.txt"
         atomic_write_text(prompt_path, prompt_text)
 
-        # By default (no --automatic), pause here: the prompt is on disk but
-        # has NOT yet been sent to the LLM, so this is the point to open
-        # prompt_path and inspect/edit it before committing GPU/API time to it.
+        # Pause before this round's LLM call unless --automatic is set —
+        # firing at every per-chunk prompt-write point.
         if not args.automatic:
             pause_for_confirmation(round_label, prompt_path)
 
         if tokenize is not None:
-            # Real tokenizer from the loaded model — this is the number that
-            # actually matters, not the chars//4 (or chars//1) estimates used
-            # on the manual prompt/revise-prompt path. Fail fast with a clear
-            # message rather than letting llama-cpp raise mid-generation.
             n_prompt_tokens = tokenize(prompt_text)
             budget = args.n_ctx - args.max_tokens
-            print(f"Round {round_n}: prompt is {n_prompt_tokens} tokens "
+            print(f"{round_label}: prompt is {n_prompt_tokens} tokens "
                   f"(budget {budget} = --n-ctx {args.n_ctx} - --max-tokens {args.max_tokens})")
             if n_prompt_tokens > budget:
                 raise SystemExit(
-                    f"Round {round_n}: prompt ({n_prompt_tokens} tokens) exceeds the available "
+                    f"{round_label}: prompt ({n_prompt_tokens} tokens) exceeds the available "
                     f"budget ({budget} tokens). Fix one of: lower --max-examples/--k, add "
                     f"--compact for RLE grid encoding, raise --n-ctx, or lower --max-tokens."
                 )
         else:
-            print(f"Round {round_n}: prompt is {len(prompt_text)} chars "
+            print(f"{round_label}: prompt is {len(prompt_text)} chars "
                   f"(no local tokenizer for --backend openai — token count not verified "
                   f"against the server's context window; watch for a context-length error)")
 
-        # Everything from here through the log write is the "risky" span this
-        # round can't cleanly redo if interrupted mid-flight (an LLM
-        # generation can take minutes; a killed sandboxed backtest just looks
-        # like a failed round rather than corrupting anything — see
-        # GracefulInterrupt's docstring). A first Ctrl+C here is deferred
-        # until this block finishes naturally; a second Ctrl+C forces an
-        # immediate stop.
         with GracefulInterrupt() as interrupt:
             call_result = llm_call(prompt_text)
             response = call_result["text"]
             finish_reason = call_result.get("finish_reason")
             completion_tokens = call_result.get("completion_tokens")
-            # finish_reason == "length" means generation was cut off by --max-tokens
-            # mid-thought (a genuinely truncated response). finish_reason == "stop"
-            # means the model emitted an end-of-sequence token on its own — the
-            # response text can look identical either way, but "stop" with a short
-            # completion_tokens count points at the model ending early on its own
-            # (e.g. from --presence-penalty/--frequency-penalty pressure building up
-            # over the response and making "just stop" look attractive), not at
-            # --max-tokens being too small.
-            print(f"Round {round_n}: generation finished with reason={finish_reason!r}"
+            print(f"{round_label}: generation finished with reason={finish_reason!r}"
                   + (f", {completion_tokens} completion tokens" if completion_tokens is not None else "")
                   + (f" (out of --max-tokens {args.max_tokens} budget)" if finish_reason == "length" else ""))
             code = extract_code(response)
-            code, n_defs = keep_first_function_def(code)
-            if n_defs > 1:
-                print(f"Round {round_n}: candidate defined predict_next_state {n_defs} times "
-                      f"(re-attempts); keeping only the first, discarding the rest")
-            candidate_path = workdir / f"candidate_round{round_n}.py"
+            code, n_defs = keep_first_class_def(code)
+            if n_defs > 0:
+                print(f"{round_label}: candidate's GameModel class/methods redefined {n_defs} extra "
+                      f"time(s) (re-attempts); keeping only the first, discarding the rest")
+            code = _validate_candidate_code(code, round_label)
+            candidate_path = workdir / f"chunk{chunk_number}_candidate_round{round_n}.py"
             atomic_write_text(candidate_path, code)
 
-            try:
-                scored, accuracy = score_candidate(candidate_path, heldout_records, **run_kwargs)
-            except (ValueError, RuntimeError, SyntaxError, OSError) as e:
-                # A candidate that fails to even run — bad import (ValueError from
-                # check_ast_imports), sandbox/runner failure (RuntimeError), or
-                # unparseable code (SyntaxError from ast.parse — e.g. a truncated
-                # generation that got cut off by --max-tokens or a repetition loop
-                # before finishing) — is scored as a zero-accuracy round rather
-                # than killing the whole loop. SyntaxError is NOT a ValueError/
-                # RuntimeError subclass, so it must be listed explicitly or it
-                # propagates straight past this except clause and crashes cmd_run_loop.
-                print(f"Round {round_n}: candidate failed to execute cleanly: "
-                      f"{type(e).__name__}: {e}")
-                scored, accuracy = [], 0.0
-
-            n_pass = sum(1 for s in scored if s["passed"])
-            n_total = len(heldout_records)
-            summary = summarize_scores(scored) if scored else None
-            log_entry = {
-                "round": round_n,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
-                "candidate": str(candidate_path),
-                "heldout_accuracy": accuracy,
-                "n_passed": n_pass,
-                "n_total": n_total,
-                "heldout_mean_cell_accuracy": summary["mean_cell_accuracy"] if summary else None,
-                "heldout_mean_changed_cell_accuracy": summary["mean_changed_cell_accuracy"] if summary else None,
-                "heldout_n_dynamic_records": summary["n_dynamic_records"] if summary else None,
-                "heldout_by_action": summary["by_action"] if summary else None,
-            }
-            if args.log:
-                with open(args.log, "a") as f:
-                    f.write(json.dumps(log_entry) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-
-        print(f"Round {round_n}: held-out accuracy {accuracy:.1%} ({n_pass}/{n_total}), "
-              f"threshold {args.threshold:.1%}")
-        if summary:
-            print_score_summary(summary, label="held-out")
-
         if interrupt.requested:
-            print(f"STOP: interrupted after round {round_n} completed. "
-                  f"Last completed candidate: {candidate_path}")
-            return
+            run_state["interrupted"] = True
 
-        if accuracy >= args.threshold:
-            print(f"STOP: threshold met at round {round_n}. Final candidate: {candidate_path}")
-            return
+        return code
 
-        if round_n == args.max_rounds:
-            print(f"STOP: reached max rounds ({args.max_rounds}) without meeting threshold. "
-                  f"Best-effort candidate: {candidate_path}")
-            return
+    return round_builder
 
-        hist_scored, hist_accuracy = score_candidate(candidate_path, history_records, **run_kwargs)
-        failures = [s for s in hist_scored if not s["passed"]]
-        if not failures:
-            print("CONTINUE: no history failures to learn from, but held-out threshold not met — "
-                  "this usually means the rule overfits the seed examples. Resampling next round's seed.")
-            counterexamples = None
-            continue
-        counterexamples = select_counterexamples(failures, args.k)
-        print(f"CONTINUE: history accuracy {hist_accuracy:.1%}, "
-              f"{len(counterexamples)} counterexamples selected for round {round_n + 1}")
+
+def cmd_run_chunked(args):
+    """
+    Fully automated chunked-curriculum loop: loads the whole cleaned trace
+    once, chronologically, and drives an outer loop over chunks (boundaries
+    computed by next_chunk_boundary) each running an inner loop of up to
+    --max-rounds rounds (extend/seed then revise, using run_chunk_rounds'
+    epsilon-reset selection with baseline recompute), reporting after every
+    chunk, and persisting whichever code each chunk ends with as the next
+    chunk's starting point.
+    """
+    workdir = Path(args.workdir)
+    workdir.mkdir(parents=True, exist_ok=True)
+    counts_path = workdir / "row_failure_counts.json"
+    best_counts_path = workdir / "row_failure_counts_best.json"
+
+    if args.max_examples < 1:
+        raise SystemExit("--max-examples must be at least 1 (used as the chunk-size cutoff; "
+                          "0 or negative would never advance the chunk boundary and loop forever)")
+
+    with open(args.trace) as f:
+        records = [json.loads(l) for l in f if l.strip()]
+    if not records:
+        raise SystemExit(f"{args.trace} contains no records")
+
+    run_kwargs = dict(cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
+                       per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout)
+    llm_call, tokenize = build_llm_caller(args)  # loads the GGUF once here for --backend llama-cpp
+    encoding = "rle" if args.compact else "hex"
+    run_state = {"interrupted": False}
+
+    prev_boundary = 0
+    pending_level_boundary = False  # chunk 1 has no predecessor and never consults this (PROMPT_TEMPLATE, not EXTEND_TEMPLATE)
+    current_best_code = None
+    running_best_accuracy = None
+    chunk_number = 0
+    final_chunk_result = None
+
+    while prev_boundary < len(records):
+        chunk_number += 1
+        boundary, is_level_boundary = next_chunk_boundary(records, prev_boundary, args.max_examples)
+        lagged_level_boundary = pending_level_boundary  # what THIS chunk's EXTEND_TEMPLATE should use
+        pending_level_boundary = is_level_boundary       # for the NEXT chunk (one-chunk lag)
+
+        baseline_code = current_best_code if chunk_number > 1 else None
+
+        round_builder = make_round_builder(
+            chunk_number, prev_boundary, boundary, lagged_level_boundary,
+            records, counts_path, workdir, llm_call, tokenize, encoding, args, run_state,
+        )
+
+        chunk_result = run_chunk_rounds(
+            round_builder, records, boundary, counts_path, best_counts_path,
+            baseline_code=baseline_code, max_rounds=args.max_rounds, **run_kwargs,
+        )
+
+        report_chunk(chunk_number, prev_boundary, boundary, chunk_result, args.max_rounds)
+        if args.log:
+            log_path = workdir / args.log if not os.path.isabs(args.log) else Path(args.log)
+            report = build_chunk_report(chunk_number, prev_boundary, boundary, chunk_result, args.max_rounds)
+            with open(log_path, "a") as f:
+                f.write(json.dumps(report) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
+
+        running_best_accuracy = update_running_best_accuracy(running_best_accuracy, chunk_result["current_best_accuracy"])
+        current_best_code = chunk_result["current_best_code"]
+        final_chunk_result = chunk_result
+
+        chunk_final_path = workdir / f"chunk{chunk_number}_final.py"
+        atomic_write_text(chunk_final_path, current_best_code)
+        print(f"[chunk {chunk_number}] final code persisted to {chunk_final_path}")
+
+        prev_boundary = boundary
+
+        if run_state["interrupted"]:
+            print(f"STOP: interrupted after chunk {chunk_number} completed. "
+                  f"Last completed candidate: {chunk_final_path}")
+            break
+
+    print_run_summary(running_best_accuracy, final_chunk_result["current_best_accuracy"], n_chunks=chunk_number)
+    print(f"Final candidate: {workdir / f'chunk{chunk_number}_final.py'}")
 
 
 # ---------- CLI wiring ----------
@@ -2196,30 +2718,18 @@ def main():
                              "skip extraction if a trace doesn't carry this field.")
     p_pre.set_defaults(func=cmd_preprocess)
 
-    p_split = sub.add_parser("split", help="Chronological 70/30 split into history / held-out")
-    p_split.add_argument("trace")
-    p_split.add_argument("history_out")
-    p_split.add_argument("heldout_out")
-    p_split.add_argument("--history-frac", type=float, default=0.7)
-    p_split.add_argument("--shuffle", action="store_true",
-                          help="Shuffle before splitting (each row is a self-contained "
-                               "transition, so this is safe — order isn't needed for "
-                               "the predict_next_state task)")
-    p_split.add_argument("--seed", type=int, default=0)
-    p_split.set_defaults(func=cmd_split)
-
-    p_prompt = sub.add_parser("prompt", help="Build the predict_next_state synthesis prompt")
+    p_prompt = sub.add_parser("prompt", help="Build the chunk-1 seed prompt from a records file")
     p_prompt.add_argument("history")
     p_prompt.add_argument("out")
     p_prompt.add_argument("--max-examples", type=int, default=25,
-                           help="Cap examples shown, spread across the trajectory (default 25)")
+                           help="Rows to include, taken from the start of the file in order (default 25)")
     p_prompt.add_argument("--compact", action="store_true",
                            help="Run-length-encode grid rows (e.g. '0*7 3*2') instead of "
                                 "one hex char per cell — cuts tokens a lot for large/sparse grids")
     p_prompt.set_defaults(func=cmd_prompt)
 
     p_backtest = sub.add_parser("backtest", help="Full teacher-forced replay + scoring for the "
-                                                  "chunked design (Step 6), class-based candidates only")
+                                                  "chunked design, class-based candidates only")
     p_backtest.add_argument("candidate", help="Path to a .py file defining class GameModel with a predict method")
     p_backtest.add_argument("trace", help="Cleaned jsonl trace file (chronological, no shuffle)")
     p_backtest.add_argument("--boundary", type=int, default=None,
@@ -2235,118 +2745,70 @@ def main():
     p_backtest.add_argument("--overall-timeout", type=int, default=60)
     p_backtest.set_defaults(func=cmd_backtest)
 
-    p_score = sub.add_parser("score", help="Sandboxed test of a candidate against any dataset")
-    p_score.add_argument("candidate", help="Path to a .py file defining predict_next_state(grid, action) -> grid")
-    p_score.add_argument("dataset", help="Cleaned jsonl file (history.jsonl or heldout.jsonl)")
-    p_score.add_argument("--out", default=None, help="Write per-record pass/fail results here")
-    p_score.add_argument("--cpu-seconds", type=int, default=10)
-    p_score.add_argument("--max-procs", type=int, default=16,
-                          help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
-    p_score.add_argument("--mem-mb", type=int, default=512)
-    p_score.add_argument("--per-call-seconds", type=int, default=2)
-    p_score.add_argument("--overall-timeout", type=int, default=60)
-    p_score.set_defaults(func=cmd_score)
-
-    p_eval = sub.add_parser("evaluate", help="Stop-condition check for the verify-and-revise loop")
-    p_eval.add_argument("candidate")
-    p_eval.add_argument("heldout")
-    p_eval.add_argument("--round", type=int, required=True, help="Current round number (1-indexed)")
-    p_eval.add_argument("--threshold", type=float, default=0.95, help="Held-out accuracy to stop at")
-    p_eval.add_argument("--max-rounds", type=int, default=10)
-    p_eval.add_argument("--log", default=None, help="Append this round's result as a json line here")
-    p_eval.add_argument("--history", default=None,
-                         help="If continuing, score against this to pick next-round counterexamples")
-    p_eval.add_argument("--counterexamples-out", default=None,
-                         help="Where to write next-round counterexamples if continuing")
-    p_eval.add_argument("--k", type=int, default=10, help="Number of counterexamples to select if continuing")
-    p_eval.add_argument("--cpu-seconds", type=int, default=10)
-    p_eval.add_argument("--max-procs", type=int, default=16,
-                         help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
-    p_eval.add_argument("--mem-mb", type=int, default=512)
-    p_eval.add_argument("--per-call-seconds", type=int, default=2)
-    p_eval.add_argument("--overall-timeout", type=int, default=60)
-    p_eval.set_defaults(func=cmd_evaluate)
-
-    p_revise = sub.add_parser("revise-prompt", help="Build a revision prompt from a candidate + counterexamples")
-    p_revise.add_argument("candidate", help="Path to the current candidate .py file")
-    p_revise.add_argument("counterexamples", help="Counterexamples jsonl written by `evaluate`")
+    p_revise = sub.add_parser("revise-prompt", help="Build a revision prompt from a candidate + row_failure_counts.json")
+    p_revise.add_argument("candidate", help="Path to the current candidate .py file (a GameModel class)")
+    p_revise.add_argument("counts", help="Path to row_failure_counts.json (written by `backtest`)")
     p_revise.add_argument("out", help="Where to write the revision prompt text")
+    p_revise.add_argument("--k", type=int, default=10,
+                           help="Number of top-failing rows (by failure count) to include as counterexamples")
     p_revise.add_argument("--compact", action="store_true",
                            help="Run-length-encode grid rows (e.g. '0*7 3*2') instead of "
                                 "one hex char per cell — cuts tokens a lot for large/sparse grids")
     p_revise.set_defaults(func=cmd_revise_prompt)
 
-    p_loop = sub.add_parser("run-loop", help="Fully automated verify-and-revise loop against a live LLM")
-    p_loop.add_argument("history")
-    p_loop.add_argument("heldout")
-    p_loop.add_argument("--workdir", default="loop_run", help="Where per-round prompts/candidates are written")
-    p_loop.add_argument("--backend", choices=["llama-cpp", "openai"], default="llama-cpp",
-                         help="llama-cpp: load a local GGUF in-process via llama-cpp-python (default). "
-                              "openai: call an OpenAI-compatible HTTP server instead (vLLM, llama-server).")
-    p_loop.add_argument("--model-path", default=None,
-                         help="[llama-cpp] path to the .gguf file, e.g. Qwen3-Coder-Next-UD-Q4_K_XL.gguf")
-    p_loop.add_argument("--n-ctx", type=int, default=32768, help="[llama-cpp] context window to allocate")
-    p_loop.add_argument("--n-gpu-layers", type=int, default=-1,
-                         help="[llama-cpp] layers to offload to GPU; -1 = all")
-    p_loop.add_argument("--verbose-llama", action="store_true",
-                         help="[llama-cpp] show llama.cpp's own load-time log (confirms how many "
-                              "layers actually landed on GPU vs. CPU — nvidia-smi memory alone "
-                              "doesn't tell you that) plus per-call timing stats (prompt eval "
-                              "tokens/sec, generation tokens/sec) after every round. Useful for "
-                              "diagnosing an unexpectedly slow round without guessing.")
-    p_loop.add_argument("--api-base", default="http://localhost:8000/v1",
-                         help="[openai] OpenAI-compatible base URL")
-    p_loop.add_argument("--model", default=None, help="[openai] model name as the server expects it")
-    p_loop.add_argument("--temperature", type=float, default=0.2)
-    p_loop.add_argument("--repeat-penalty", type=float, default=1.3,
-                         help="[llama-cpp only] penalizes tokens already seen in the response so "
-                              "far; llama.cpp's own default (1.1) and our earlier 1.15 both proved "
-                              "insufficient to stop a real repetition loop we hit (model got stuck "
-                              "restating the same reasoning until --max-tokens cut it off before "
-                              "reaching a return statement) — 1.3 is a stronger starting point. No "
-                              "equivalent field exists in the OpenAI chat-completions schema, so "
-                              "--backend openai ignores this.")
-    p_loop.add_argument("--presence-penalty", type=float, default=0.1,
-                         help="Flat penalty applied to any token already used at all, regardless "
-                              "of how many times (unlike --frequency-penalty, which scales with "
-                              "repeat count). llama-cpp and openai backends both support this. "
-                              "Kept small (0.1) — a higher value (we tried 0.3) stacked with "
-                              "--repeat-penalty can make 'just stop' look increasingly attractive "
-                              "the longer a response runs (more of the vocabulary has been used "
-                              "and is now penalized), causing the model to end generation early "
-                              "(finish_reason='stop') well before finishing the function — check "
-                              "the finish_reason/completion_tokens line each round printed by this "
-                              "command to see if that's happening before raising this further.")
-    p_loop.add_argument("--frequency-penalty", type=float, default=0.1,
-                         help="Extra per-repeat-token penalty that scales with how often a token "
-                              "has already appeared (llama-cpp and openai backends both support "
-                              "this). Works alongside --repeat-penalty against repetition loops; "
-                              "kept small (0.1) so it doesn't distort legitimate repeated content "
-                              "like grid digits or RLE run markers.")
-    p_loop.add_argument("--max-tokens", type=int, default=4096)
-    p_loop.add_argument("--max-examples", type=int, default=25, help="Seed examples for round 1")
-    p_loop.add_argument("--compact", action="store_true",
-                         help="Run-length-encode grid rows (e.g. '0*7 3*2') instead of "
-                              "one hex char per cell — cuts tokens a lot for large/sparse grids")
-    p_loop.add_argument("--threshold", type=float, default=0.95)
-    p_loop.add_argument("--max-rounds", type=int, default=10)
-    p_loop.add_argument("--k", type=int, default=10, help="Counterexamples per revision round")
-    p_loop.add_argument("--log", default="rounds.jsonl")
-    p_loop.add_argument("--automatic", action="store_true",
-                         help="Run every round back-to-back with no pauses. Default (flag "
-                              "off): after each round's prompt (seed or revision) is written "
-                              "to --workdir, the loop stops and asks whether to continue — "
-                              "before that round's LLM call is made — so you can open and "
-                              "inspect/edit prompt_round{N}.txt first. Answer 'n' to abort "
-                              "the run at that point; anything else (including a bare Enter) "
-                              "continues.")
-    p_loop.add_argument("--cpu-seconds", type=int, default=10)
-    p_loop.add_argument("--max-procs", type=int, default=16,
-                         help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
-    p_loop.add_argument("--mem-mb", type=int, default=512)
-    p_loop.add_argument("--per-call-seconds", type=int, default=2)
-    p_loop.add_argument("--overall-timeout", type=int, default=60)
-    p_loop.set_defaults(func=cmd_run_loop)
+    p_chunked = sub.add_parser("run-chunked", help="Fully automated CHUNKED-CURRICULUM run against a live LLM")
+    p_chunked.add_argument("trace", help="The FULL cleaned trace, one file, chronological (no history/heldout split)")
+    p_chunked.add_argument("--workdir", default="chunked_run", help="Where per-round prompts/candidates/counts are written")
+    p_chunked.add_argument("--backend", choices=["llama-cpp", "openai"], default="llama-cpp",
+                            help="llama-cpp: load a local GGUF in-process via llama-cpp-python (default). "
+                                 "openai: call an OpenAI-compatible HTTP server instead (vLLM, llama-server).")
+    p_chunked.add_argument("--model-path", default=None,
+                            help="[llama-cpp] path to the .gguf file, e.g. Qwen3-Coder-Next-UD-Q4_K_XL.gguf")
+    p_chunked.add_argument("--n-ctx", type=int, default=32768, help="[llama-cpp] context window to allocate")
+    p_chunked.add_argument("--n-gpu-layers", type=int, default=-1,
+                            help="[llama-cpp] layers to offload to GPU; -1 = all")
+    p_chunked.add_argument("--verbose-llama", action="store_true",
+                            help="[llama-cpp] show llama.cpp's own load-time log plus per-call timing "
+                                 "stats after every round.")
+    p_chunked.add_argument("--api-base", default="http://localhost:8000/v1",
+                            help="[openai] OpenAI-compatible base URL")
+    p_chunked.add_argument("--model", default=None, help="[openai] model name as the server expects it")
+    p_chunked.add_argument("--temperature", type=float, default=0.2)
+    p_chunked.add_argument("--repeat-penalty", type=float, default=1.3,
+                            help="[llama-cpp only] penalizes tokens already seen in the response so far; "
+                                 "llama.cpp's own default (1.1) proved insufficient to stop a real "
+                                 "repetition loop hit during testing (model got stuck restating the same "
+                                 "reasoning until --max-tokens cut it off before finishing) — 1.3 is a "
+                                 "stronger starting point.")
+    p_chunked.add_argument("--presence-penalty", type=float, default=0.1)
+    p_chunked.add_argument("--frequency-penalty", type=float, default=0.1)
+    p_chunked.add_argument("--max-tokens", type=int, default=4096)
+    p_chunked.add_argument("--max-examples", type=int, default=25,
+                            help="Rows per ORDINARY chunk (the boundary rule may end a chunk "
+                                 "earlier than this, on a level cutoff or the end of the trace)")
+    p_chunked.add_argument("--compact", action="store_true",
+                            help="Run-length-encode grid rows (e.g. '0*7 3*2') instead of "
+                                 "one hex char per cell — cuts tokens a lot for large/sparse grids")
+    p_chunked.add_argument("--max-rounds", type=int, default=2,
+                            help="Rounds PER CHUNK (extend/seed, then up to this many revisions) — "
+                                 "chunked design default is 2; a chunk can still end sooner via the "
+                                 "zero-failure early stop")
+    p_chunked.add_argument("--k", type=int, default=10, help="Top-failing counterexamples per revision round")
+    p_chunked.add_argument("--log", default="chunk_log.jsonl",
+                            help="Append each chunk's structured report (build_chunk_report) here as "
+                                 "json lines, relative to --workdir unless given as an absolute path. "
+                                 "Empty string disables this.")
+    p_chunked.add_argument("--automatic", action="store_true",
+                            help="Run every round of every chunk back-to-back with no pauses. Default "
+                                 "(flag off): after each round's prompt is written to --workdir, the loop "
+                                 "stops and asks whether to continue, before that round's LLM call is made.")
+    p_chunked.add_argument("--cpu-seconds", type=int, default=10)
+    p_chunked.add_argument("--max-procs", type=int, default=16,
+                            help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
+    p_chunked.add_argument("--mem-mb", type=int, default=512)
+    p_chunked.add_argument("--per-call-seconds", type=int, default=2)
+    p_chunked.add_argument("--overall-timeout", type=int, default=60)
+    p_chunked.set_defaults(func=cmd_run_chunked)
 
     args = p.parse_args()
     args.func(args)

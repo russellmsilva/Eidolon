@@ -1,0 +1,58 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Pinned to match the Python version trace_tools.py actually runs
+          # under on JarvisLabs -- a CI pass on a different version isn't
+          # meaningful confidence about the real deployment target.
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run step tests
+        # No pytest/unittest here by design -- these are plain scripts that
+        # assert and print, exiting nonzero on an uncaught AssertionError.
+        # Looped in one step (not one step per file), but still reports
+        # each file's own pass/fail explicitly rather than just failing the
+        # whole job on the first bad one.
+        run: |
+          set +e  # don't let one failing test file abort the loop early
+          failed=()
+
+          for test_file in "Simplified Implementation Step Tests"/test_step*.py; do
+            echo "::group::$test_file"
+            python "$test_file"
+            status=$?
+            echo "::endgroup::"
+
+            if [ "$status" -eq 0 ]; then
+              echo "PASSED: $test_file"
+            else
+              echo "FAILED: $test_file (exit code $status)"
+              failed+=("$test_file")
+            fi
+          done
+
+          echo ""
+          echo "================ Summary ================"
+          if [ ${#failed[@]} -eq 0 ]; then
+            echo "All test files passed."
+          else
+            echo "${#failed[@]} test file(s) FAILED:"
+            for f in "${failed[@]}"; do
+              echo "  - $f"
+            done
+            exit 1
+          fi

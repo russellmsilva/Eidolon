@@ -1,0 +1,14 @@
+# trace_tools.py's own imports (argparse, json, os, subprocess, ast, etc.)
+# are all standard library. numpy is the one non-stdlib dependency: it's
+# one of the two packages a candidate GameModel class is allowed to import
+# (see ALLOWED_IMPORTS in trace_tools.py), and it's what the sandboxed
+# runner subprocess needs available if any candidate actually uses it.
+#
+# Deliberately NOT listed here: llama-cpp-python, and any OpenAI client
+# library. Both are only needed for `run-chunked`'s live-LLM backends
+# (--backend llama-cpp / --backend openai), which the test suite never
+# exercises -- every test monkeypatches build_llm_caller with a fake, so
+# no real backend is ever loaded. llama-cpp-python in particular is a
+# heavy, GPU-oriented build (needs a CMake/CUDA toolchain) that has no
+# place in a CPU-only CI job.
+numpy

@@ -69,8 +69,13 @@ all_ok &= check(
 # correctly labeled (not a separately-named "Resulting Grid").
 # ---------------------------------------------------------------------------
 print("\n=== Case 3: overflow fallback ===")
-big_before = [[0] * 10 for _ in range(10)]  # 100 cells
-big_after = [[1] * 10 for _ in range(10)]   # all 100 cells changed, well above DIFF_MAX_CELLS=40
+# One row of DIFF_MAX_CELLS + 1 cells, every one of them changed -- exactly
+# one more than the threshold, tied to the real constant rather than a
+# hardcoded guess that could silently stop testing the actual boundary if
+# DIFF_MAX_CELLS ever changes.
+n_cells = DIFF_MAX_CELLS + 1
+big_before = [[0] * n_cells]
+big_after = [[1] * n_cells]
 overflow_records = [
     {"step": 5, "action": "ACTION_A", "grid_before": big_before, "grid_after": big_after},
 ]
