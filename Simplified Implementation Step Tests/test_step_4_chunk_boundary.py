@@ -11,9 +11,9 @@ def check(label, condition):
 all_ok = True
 
 # ---------------------------------------------------------------------------
-# Primary test, exactly as specified by Step 4's "Test before moving on":
-# max_examples=20, trace length 80, a single level completion at (1-indexed)
-# row 45. Each cleaned record carries its OWN levels_completed_before/after
+# Primary test -- worked example matching a real scenario: max_examples=20,
+# trace length 80, a single level completion at (1-indexed) row 45. Each
+# cleaned record carries its OWN levels_completed_before/after
 # pair (from that row's pre_observation/post_observation) -- a level
 # completes during record index 44 specifically (before=0, after=1), so
 # next_level_completion_row should report the count-boundary 45 = 44 + 1.

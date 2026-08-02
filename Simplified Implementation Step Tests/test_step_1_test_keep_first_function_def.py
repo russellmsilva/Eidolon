@@ -1,12 +1,12 @@
 import ast
 import sys
-from trace_tools import keep_first_function_def
+from trace_tools import keep_first_class_def
 
 PASS = "PASS"
 FAIL = "FAIL"
 
 def check(name, source, expect_defs, expect_source_check):
-    trimmed, n_defs = keep_first_function_def(source)
+    trimmed, n_defs = keep_first_class_def(source)
     ok_defs = (n_defs == expect_defs)
     ok_parses = True
     try:
@@ -94,14 +94,14 @@ all_ok &= check(
 # Bonus (d): syntax error input should pass through unchanged with 0 defs,
 # per the documented contract (caller's own ast.parse raises normally).
 case_d = "class GameModel:\n    def predict(self:\n        pass\n"
-trimmed_d, n_defs_d = keep_first_function_def(case_d)
+trimmed_d, n_defs_d = keep_first_class_def(case_d)
 ok_d = (trimmed_d == case_d and n_defs_d == 0)
 print(f"[{'PASS' if ok_d else 'FAIL'}] d) syntax error passthrough  (n_defs={n_defs_d})")
 all_ok &= ok_d
 
 # Bonus (e): no GameModel class present at all -- source untouched, 0 defs.
 case_e = "def some_other_function():\n    return 1\n"
-trimmed_e, n_defs_e = keep_first_function_def(case_e)
+trimmed_e, n_defs_e = keep_first_class_def(case_e)
 ok_e = (trimmed_e == case_e and n_defs_e == 0)
 print(f"[{'PASS' if ok_e else 'FAIL'}] e) no GameModel class present  (n_defs={n_defs_e})")
 all_ok &= ok_e
