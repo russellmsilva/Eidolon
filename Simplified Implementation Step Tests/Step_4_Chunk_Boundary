@@ -1,0 +1,150 @@
+import sys
+sys.path.insert(0, ".")
+from trace_tools import next_chunk_boundary, next_level_completion_row
+
+
+def check(label, condition):
+    print(f"[{'PASS' if condition else 'FAIL'}] {label}")
+    return condition
+
+
+all_ok = True
+
+# ---------------------------------------------------------------------------
+# Primary test, exactly as specified by Step 4's "Test before moving on":
+# max_examples=20, trace length 80, a single level completion at (1-indexed)
+# row 45. Each cleaned record carries its OWN levels_completed_before/after
+# pair (from that row's pre_observation/post_observation) -- a level
+# completes during record index 44 specifically (before=0, after=1), so
+# next_level_completion_row should report the count-boundary 45 = 44 + 1.
+# Expect the boundary sequence 20, 40, 45, 65, 80, with is_level_boundary
+# True only for the call whose OWN boundary is 45 (the 40->45 chunk), and
+# False for every other call -- including the one whose boundary is 65
+# (the 45->65 chunk that starts right after the cutoff).
+# ---------------------------------------------------------------------------
+TRACE_LEN = 80
+LEVEL_UP_AT_IDX = 44  # records[44]: before=0, after=1 -- everything else flat
+
+
+def make_record(i, level_completes_here, already_past):
+    lvl = 1 if already_past else 0
+    return {
+        "step": i,
+        "action": "ACTION_UP",
+        "grid_before": [[0]],
+        "grid_after": [[0]],
+        "levels_completed_before": lvl,
+        "levels_completed_after": 1 if level_completes_here else lvl,
+    }
+
+
+records = [
+    make_record(i, level_completes_here=(i == LEVEL_UP_AT_IDX), already_past=(i > LEVEL_UP_AT_IDX))
+    for i in range(TRACE_LEN)
+]
+
+print("=== Primary test: worked example (max_examples=20, level completes at row 45, trace_len=80) ===")
+expected_boundaries = [20, 40, 45, 65, 80]
+expected_is_level = [False, False, True, False, False]
+
+prev_boundary = 0
+actual_boundaries = []
+actual_is_level = []
+for _ in range(len(expected_boundaries)):
+    next_boundary, is_level_boundary = next_chunk_boundary(records, prev_boundary, max_examples=20)
+    actual_boundaries.append(next_boundary)
+    actual_is_level.append(is_level_boundary)
+    prev_boundary = next_boundary
+
+print(f"expected boundaries: {expected_boundaries}")
+print(f"actual boundaries:   {actual_boundaries}")
+print(f"expected is_level:   {expected_is_level}")
+print(f"actual is_level:     {actual_is_level}")
+
+all_ok &= check("boundary sequence matches 20, 40, 45, 65, 80", actual_boundaries == expected_boundaries)
+all_ok &= check(
+    "is_level_boundary True only for the call whose own boundary is 45",
+    actual_is_level == expected_is_level,
+)
+all_ok &= check(
+    "loop terminates exactly at len(records) (last boundary == 80, no further calls needed)",
+    actual_boundaries[-1] == TRACE_LEN,
+)
+
+# ---------------------------------------------------------------------------
+# Bonus: no minimum chunk size -- a level completes ON the very first row of
+# a new chunk (record at index == prev_boundary itself), boundary should
+# still legitimately be prev_boundary + 1, not clamped/merged into anything
+# bigger.
+# ---------------------------------------------------------------------------
+print("\n=== Bonus: no minimum chunk size (level completes on the first row of the new chunk) ===")
+tiny_records = [
+    {"step": 0, "levels_completed_before": 0, "levels_completed_after": 0},
+    {"step": 1, "levels_completed_before": 0, "levels_completed_after": 0},
+    {"step": 2, "levels_completed_before": 0, "levels_completed_after": 1},  # completes here -> boundary 3
+    {"step": 3, "levels_completed_before": 1, "levels_completed_after": 1},
+    {"step": 4, "levels_completed_before": 1, "levels_completed_after": 1},
+]
+next_boundary, is_level_boundary = next_chunk_boundary(tiny_records, prev_boundary=2, max_examples=20)
+all_ok &= check(
+    "level completing on the very next row gives prev_boundary + 1, not clamped",
+    next_boundary == 3 and is_level_boundary is True,
+)
+
+# ---------------------------------------------------------------------------
+# Bonus: no level completions anywhere -- only the ordinary cap and
+# whole-trace cutoffs should ever fire, is_level_boundary always False.
+# ---------------------------------------------------------------------------
+print("\n=== Bonus: trace with no level completions at all ===")
+flat_records = [
+    {"step": i, "levels_completed_before": 0, "levels_completed_after": 0}
+    for i in range(37)
+]
+prev_boundary = 0
+flat_boundaries = []
+flat_is_level = []
+while prev_boundary < len(flat_records):
+    next_boundary, is_level_boundary = next_chunk_boundary(flat_records, prev_boundary, max_examples=15)
+    flat_boundaries.append(next_boundary)
+    flat_is_level.append(is_level_boundary)
+    prev_boundary = next_boundary
+print(f"boundaries: {flat_boundaries}, is_level: {flat_is_level}")
+all_ok &= check(
+    "pure cap/whole-trace cutoffs only: 15, 30, 37, all is_level_boundary False",
+    flat_boundaries == [15, 30, 37] and not any(flat_is_level),
+)
+
+# ---------------------------------------------------------------------------
+# Bonus: next_level_completion_row in isolation -- None when scanning starts
+# past the only completion in the trace (already covered above implicitly,
+# but worth asserting directly against the helper itself).
+# ---------------------------------------------------------------------------
+print("\n=== Bonus: next_level_completion_row returns None once scanned past ===")
+all_ok &= check(
+    "scanning from prev_boundary=45 (just past the completion) finds nothing further",
+    next_level_completion_row(records, 45) is None,
+)
+all_ok &= check(
+    "scanning from prev_boundary=0 finds the completion at boundary 45",
+    next_level_completion_row(records, 0) == 45,
+)
+
+# ---------------------------------------------------------------------------
+# Bonus: missing/partial levels_completed fields are skipped, not crashed on
+# or misread as a completion.
+# ---------------------------------------------------------------------------
+print("\n=== Bonus: missing levels_completed fields are treated as no signal ===")
+missing_records = [
+    {"step": 0},  # no fields at all
+    {"step": 1, "levels_completed_before": 0},  # only one side present
+    {"step": 2, "levels_completed_after": 1},  # only the other side present
+    {"step": 3, "levels_completed_before": 0, "levels_completed_after": 0},
+]
+all_ok &= check(
+    "no crash, and no false completion detected among partial/missing rows",
+    next_level_completion_row(missing_records, 0) is None,
+)
+
+print()
+print("ALL PASS" if all_ok else "SOME FAILED")
+sys.exit(0 if all_ok else 1)

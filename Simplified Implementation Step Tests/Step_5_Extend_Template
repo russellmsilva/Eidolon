@@ -1,0 +1,165 @@
+import sys
+sys.path.insert(0, ".")
+from trace_tools import (
+    build_examples_block,
+    build_description_instruction,
+    build_initial_prompt,
+    build_extend_prompt,
+    DIFF_MAX_CELLS,
+)
+
+
+def check(label, condition):
+    print(f"[{'PASS' if condition else 'FAIL'}] {label}")
+    return condition
+
+
+all_ok = True
+
+
+def make_records(n, start_step=21):
+    """n contiguous records, each just incrementing one cell so diffs stay small."""
+    records = []
+    grid = [[0, 0], [0, 0]]
+    for i in range(n):
+        before = [row[:] for row in grid]
+        grid[0][0] = (grid[0][0] + 1) % 16
+        after = [row[:] for row in grid]
+        records.append({
+            "step": start_step + i,
+            "action": f"ACTION_{i}",
+            "grid_before": before,
+            "grid_after": after,
+        })
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Case 1: basic contiguous batch, is_extend=False
+# ---------------------------------------------------------------------------
+print("=== Case 1: build_examples_block, is_extend=False ===")
+records = make_records(3)
+block = build_examples_block(records, encoding="hex", is_extend=False)
+print(block)
+
+all_ok &= check("exactly one 'Starting Grid:' occurrence", block.count("Starting Grid:") == 1)
+all_ok &= check("Grid 1 labeled with correct trace step", f"Grid 1 (trace step {records[0]['step']})" in block)
+all_ok &= check("Grid 2 labeled with correct trace step", f"Grid 2 (trace step {records[1]['step']})" in block)
+all_ok &= check("Grid 3 labeled with correct trace step", f"Grid 3 (trace step {records[2]['step']})" in block)
+all_ok &= check("Grid 1's diff keyed to Starting Grid -> Grid 1", "changed cells (Starting Grid -> Grid 1):" in block)
+all_ok &= check("Grid 2's diff keyed to Grid 1 -> Grid 2", "changed cells (Grid 1 -> Grid 2):" in block)
+all_ok &= check("Grid 3's diff keyed to Grid 2 -> Grid 3", "changed cells (Grid 2 -> Grid 3):" in block)
+all_ok &= check("is_extend sentence absent when is_extend=False", "NOT the start of the game" not in block)
+all_ok &= check("no full grid shown for ordinary (non-overflow) examples", "in full (shown because" not in block)
+
+# ---------------------------------------------------------------------------
+# Case 2: same records, is_extend=True -- the extra sentence should appear
+# ---------------------------------------------------------------------------
+print("\n=== Case 2: build_examples_block, is_extend=True ===")
+block_extend = build_examples_block(records, encoding="hex", is_extend=True)
+all_ok &= check("is_extend sentence present when is_extend=True", "NOT the start of the game" in block_extend)
+all_ok &= check(
+    "everything else unaffected by is_extend (same Grid labels present)",
+    "Grid 1 (trace step" in block_extend and "Grid 3 (trace step" in block_extend,
+)
+
+# ---------------------------------------------------------------------------
+# Case 3: overflow fallback -- manufacture a record with > DIFF_MAX_CELLS
+# changed cells and confirm the "Grid i in full" fallback triggers and is
+# correctly labeled (not a separately-named "Resulting Grid").
+# ---------------------------------------------------------------------------
+print("\n=== Case 3: overflow fallback ===")
+big_before = [[0] * 10 for _ in range(10)]  # 100 cells
+big_after = [[1] * 10 for _ in range(10)]   # all 100 cells changed, well above DIFF_MAX_CELLS=40
+overflow_records = [
+    {"step": 5, "action": "ACTION_A", "grid_before": big_before, "grid_after": big_after},
+]
+overflow_block = build_examples_block(overflow_records, encoding="hex", is_extend=False)
+print(overflow_block)
+all_ok &= check(
+    "overflow fallback triggers for a high-change-count example",
+    "Grid 1 in full (shown because too many cells changed to list individually):" in overflow_block,
+)
+all_ok &= check(
+    "overflow fallback uses the same 'Grid i' label, not a separate 'Resulting Grid' name",
+    "Resulting Grid" not in overflow_block,
+)
+
+# ---------------------------------------------------------------------------
+# Case 4: contiguity precondition is enforced
+# ---------------------------------------------------------------------------
+print("\n=== Case 4: contiguity assertion ===")
+broken_records = [
+    {"step": 0, "action": "A", "grid_before": [[0]], "grid_after": [[1]]},
+    {"step": 1, "action": "B", "grid_before": [[9]], "grid_after": [[2]]},  # doesn't match [[1]]
+]
+try:
+    build_examples_block(broken_records)
+    all_ok &= check("non-contiguous records raise AssertionError", False)
+except AssertionError:
+    all_ok &= check("non-contiguous records raise AssertionError", True)
+
+# ---------------------------------------------------------------------------
+# Case 5: build_description_instruction -- level-boundary sentence only for
+# is_extend=True AND is_level_boundary=True.
+# ---------------------------------------------------------------------------
+print("\n=== Case 5: build_description_instruction level-boundary flag ===")
+instr_initial = build_description_instruction(is_extend=False)
+instr_extend_no_boundary = build_description_instruction(is_extend=True, is_level_boundary=False)
+instr_extend_boundary = build_description_instruction(is_extend=True, is_level_boundary=True)
+
+all_ok &= check("PROMPT_TEMPLATE instruction has 3 steps", "There are three steps" in instr_initial)
+all_ok &= check("PROMPT_TEMPLATE instruction never mentions NEW LEVEL", "NEW LEVEL" not in instr_initial)
+all_ok &= check("EXTEND_TEMPLATE (no boundary) has 4 steps", "There are four steps" in instr_extend_no_boundary)
+all_ok &= check(
+    "EXTEND_TEMPLATE (no boundary) does NOT mention NEW LEVEL",
+    "NEW LEVEL" not in instr_extend_no_boundary,
+)
+all_ok &= check(
+    "EXTEND_TEMPLATE (is_level_boundary=True) DOES mention NEW LEVEL",
+    "NEW LEVEL" in instr_extend_boundary,
+)
+all_ok &= check(
+    "is_level_boundary=True ignored when is_extend=False (PROMPT_TEMPLATE has no boundary variant)",
+    "NEW LEVEL" not in build_description_instruction(is_extend=False, is_level_boundary=True),
+)
+
+# ---------------------------------------------------------------------------
+# Case 6: full prompt integration -- build_initial_prompt / build_extend_prompt
+# actually format cleanly and route the right content to the right template.
+# ---------------------------------------------------------------------------
+print("\n=== Case 6: full prompt integration ===")
+full_records = make_records(3, start_step=0)
+initial_prompt, n_used = build_initial_prompt(full_records, max_examples=3, encoding="hex")
+all_ok &= check("build_initial_prompt uses all 3 records (n_used == 3)", n_used == 3)
+all_ok &= check("initial prompt asks for GameModel class", "class GameModel" in initial_prompt)
+all_ok &= check("initial prompt has no is_extend sentence", "NOT the start of the game" not in initial_prompt)
+all_ok &= check("initial prompt has the 3-step DESCRIPTION instruction", "There are three steps" in initial_prompt)
+
+fake_candidate_code = (
+    "class GameModel:\n"
+    "    def predict(self, grid_before, action, previous_state):\n"
+    "        return grid_before, False, previous_state\n"
+)
+extend_prompt_no_boundary = build_extend_prompt(
+    fake_candidate_code, full_records, encoding="hex", is_level_boundary=False
+)
+extend_prompt_boundary = build_extend_prompt(
+    fake_candidate_code, full_records, encoding="hex", is_level_boundary=True
+)
+
+all_ok &= check(
+    "extend prompt shows the candidate's current class code",
+    "def predict(self, grid_before" in extend_prompt_no_boundary,
+)
+all_ok &= check("extend prompt has the is_extend sentence", "NOT the start of the game" in extend_prompt_no_boundary)
+all_ok &= check("extend prompt (no boundary) has no NEW LEVEL sentence", "NEW LEVEL" not in extend_prompt_no_boundary)
+all_ok &= check("extend prompt (is_level_boundary=True) has NEW LEVEL sentence", "NEW LEVEL" in extend_prompt_boundary)
+all_ok &= check(
+    "extend prompt asks to keep predict's exact signature",
+    "must keep this exact signature" in extend_prompt_no_boundary,
+)
+
+print()
+print("ALL PASS" if all_ok else "SOME FAILED")
+sys.exit(0 if all_ok else 1)
