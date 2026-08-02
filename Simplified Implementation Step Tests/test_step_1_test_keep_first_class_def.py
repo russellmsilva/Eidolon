@@ -1,5 +1,7 @@
 import ast
 import sys
+
+sys.path.insert(0, ".")
 from trace_tools import keep_first_class_def
 
 PASS = "PASS"

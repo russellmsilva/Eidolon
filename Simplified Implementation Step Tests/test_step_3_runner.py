@@ -12,7 +12,7 @@ from pathlib import Path
 sys.path.insert(0, ".")  # adjust if trace_tools.py lives elsewhere
 from trace_tools import run_candidate
 
-USE_SANDBOX = True  # flip to False only for a plumbing check without bwrap
+USE_SANDBOX = False  # flip to False only for a plumbing check without bwrap
 
 
 def write_candidate(tmpdir, name, source):
