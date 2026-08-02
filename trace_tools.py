@@ -232,11 +232,12 @@ def build_bwrap_command(python_exe, runner_path_in_sandbox, staging_dir):
     check_ast_imports at all, since that check can be bypassed via
     __import__() or bare open() (both builtins, no `import` statement).
     """
-    # run_candidate execs this command with env={} (deliberately wiped so the
-    # candidate inherits no secrets) — but that also strips PATH for the
-    # bwrap invocation itself, so a bare "bwrap" would only resolve against
-    # the POSIX fallback path (~/bin:/usr/bin), not wherever it's actually
-    # installed (e.g. a conda env's bin/, common when installed via
+    # run_candidate execs this command with an env that's deliberately wiped
+    # of secrets (just a couple of BLAS thread-count pins added on top — see
+    # run_candidate) — but that also strips PATH for the bwrap invocation
+    # itself, so a bare "bwrap" would only resolve against the POSIX
+    # fallback path (~/bin:/usr/bin), not wherever it's actually installed
+    # (e.g. a conda env's bin/, common when installed via
     # `conda install -c conda-forge bubblewrap`). Resolve the absolute path
     # now, while the *current* process's real PATH is still intact, so no
     # PATH lookup is needed at exec time.
@@ -315,7 +316,7 @@ def describe(obj, path="root", max_depth=6, depth=0):
 # subprocess + resource.setrlimit + env wiping + a timeout. If this ever runs
 # somewhere with real container control, those would be worth adding on top.
 
-ALLOWED_IMPORTS = {"copy", "itertools", "math", "collections", "functools"}
+ALLOWED_IMPORTS = {"copy", "itertools", "math", "collections", "functools", "numpy"}
 
 
 def check_ast_imports(source):
@@ -361,11 +362,33 @@ with open({candidate_path!r}) as f:
     source = f.read()
 exec(compile(source, {candidate_path!r}, "exec"), candidate_globals)
 
-predict_next_state = candidate_globals.get("predict_next_state")
-if predict_next_state is None:
-    print(json.dumps({{"error": "predict_next_state not defined in candidate"}}))
+GameModelClass = candidate_globals.get({class_name!r})
+if GameModelClass is None:
+    print(json.dumps({{"error": {class_name!r} + " not defined in candidate"}}))
     sys.exit(1)
 
+try:
+    model = GameModelClass()
+except Exception as e:
+    print(json.dumps({{"error": f"failed to instantiate {class_name!r}: {{type(e).__name__}}: {{e}}"}}))
+    sys.exit(1)
+
+# `state` starts as an empty dict for the first row of this sequential pass —
+# there is no prior call to have produced one yet. From then on it is always
+# exactly what the candidate's own predict() returned on the previous row;
+# the harness never reconstructs or corrects it. grid_before, in contrast, is
+# always the true grid from the trace for every row (teacher-forced at the
+# grid level, per design doc §1) — a wrong prediction never contaminates the
+# next row's grid input, only `state` can drift.
+state = {{}}
+
+# Feeding the whole row range for this call into stdin upfront (see
+# run_candidate) does NOT give any row's prediction access to a later row's
+# true grid — each loop iteration only ever reads THIS row's grid_before/
+# action off stdin, so a given row's prediction depends only on rows already
+# processed earlier in this same sequential pass. That's enforced by the
+# loop's order below, not by anything about how much data physically arrived
+# in the input buffer.
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -373,27 +396,47 @@ for line in sys.stdin:
     rec = json.loads(line)
     signal.alarm({per_call_seconds})
     try:
-        pred = predict_next_state(rec["grid_before"], rec["action"])
-        result = {{"step": rec["step"], "prediction": pred}}
+        predicted_grid_after, goal, state = model.predict(rec["grid_before"], rec["action"], state)
     except Exception as e:
-        result = {{"step": rec["step"], "error": f"{{type(e).__name__}}: {{e}}"}}
-    finally:
+        # Abort-on-crash (design doc §1): don't try to carry the last-good
+        # state forward and keep going — emit this row as an error and stop
+        # the whole sequential pass right here. Every row after this one is
+        # simply never emitted; the parent process's scoring treats "no
+        # result for this step" as incorrect/missing.
         signal.alarm(0)
-    print(json.dumps(result))
+        print(json.dumps({{"step": rec["step"], "error": f"{{type(e).__name__}}: {{e}}"}}))
+        break
+    signal.alarm(0)
+    print(json.dumps({{"step": rec["step"], "prediction": predicted_grid_after, "goal": bool(goal)}}))
 """
 
 
 def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
                    per_call_seconds=2, overall_timeout=60, max_procs=16,
-                   use_sandbox=True):
+                   use_sandbox=True, class_name="GameModel"):
     """
-    Run predict_next_state(grid_before, action) from candidate_path against
-    each record, in a subprocess with CPU/memory/process-count limits and a
-    per-call alarm timeout (so one pathological input can't hang the whole
+    Run a candidate's `class GameModel: def predict(self, grid_before, action,
+    previous_state) -> (predicted_grid_after, goal, state)` from
+    candidate_path, in a subprocess with CPU/memory/process-count limits and
+    a per-row alarm timeout (so one pathological row can't hang the whole
     batch). The subprocess's environment is wiped (no inherited API keys,
-    tokens, etc.) since the candidate has no legitimate need for any of it —
-    it only needs a grid and an action in, a grid out. Returns
-    {step: {"prediction": grid} or {"error": str}}.
+    tokens, etc. — only a couple of BLAS thread-count pins, see below) since
+    the candidate has no legitimate need for any of it.
+
+    This is one sequential, stateful rollout over `records` in trace order:
+    the candidate's class is instantiated once, and `state` — whatever the
+    candidate's own predict() returned — is threaded from each row into the
+    next row's call. `grid_before` fed into each call always comes straight
+    from `records`, never from a prior prediction, so a wrong grid
+    prediction never compounds forward; only candidate-tracked `state` can
+    drift on its own. If a row's predict() call raises (including a
+    SIGALRM-driven timeout), the whole rollout aborts at that point — no
+    attempt is made to keep going with stale state (design doc §1) — so
+    every row from the failure point onward is simply absent from the
+    returned dict, and the caller's own scoring is responsible for treating
+    a missing step as incorrect.
+
+    Returns {step: {"prediction": grid, "goal": bool} or {"error": str}}.
     """
     candidate_path = str(candidate_path)
     source = Path(candidate_path).read_text()
@@ -419,6 +462,7 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
             cpu=cpu_seconds, mem_bytes=mem_mb * 1024 * 1024,
             candidate_path=runner_candidate_path,
             per_call_seconds=per_call_seconds, max_procs=max_procs,
+            class_name=class_name,
         )
 
         if use_sandbox:
@@ -431,14 +475,42 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
                 f.write(runner_code)
             exec_cmd = [sys.executable, runner_path]
 
+        # The entire row range for this call is serialized to stdin upfront,
+        # all at once, below. This does NOT give an earlier row's prediction
+        # access to a later row's true grid — the runner (RUNNER_TEMPLATE)
+        # only ever reads one row's grid_before/action off stdin per loop
+        # iteration, so a given row's prediction depends only on rows it has
+        # already processed in that same sequential pass. That guarantee
+        # comes from the runner's loop order, not from anything about how
+        # much data physically arrived in the stdin buffer — worth pinning
+        # down explicitly here since it was a point of confusion earlier.
         stdin_data = "\n".join(
             json.dumps({"step": r["step"], "action": r["action"], "grid_before": r["grid_before"]})
             for r in records
         )
+        # env is otherwise still fully wiped (no inherited API keys/tokens —
+        # the candidate has no legitimate need for any of it) EXCEPT for
+        # these thread-count pins. Without them, numpy's BLAS backend
+        # (OpenBLAS on this box) auto-detects the host's core count on
+        # import and pre-reserves a memory buffer per thread before the
+        # candidate's code runs at all — on a many-core GPU box that alone
+        # can exceed the sandbox's RLIMIT_AS cap (default 512MB), producing
+        # "OpenBLAS error: Memory allocation still failed" even for a
+        # trivial candidate that never does real linear algebra. Pinning to
+        # 1 thread makes memory use scale with what the candidate actually
+        # does, not with host core count. Covers the three common backends
+        # (OpenBLAS, a generic OpenMP-linked BLAS, MKL) plus numexpr, which
+        # some numpy builds pull in transitively.
+        sandbox_env = {
+            "OPENBLAS_NUM_THREADS": "1",
+            "OMP_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+        }
         try:
             proc = subprocess.run(
                 exec_cmd, input=stdin_data, capture_output=True, text=True,
-                timeout=overall_timeout, env={},
+                timeout=overall_timeout, env=sandbox_env,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"candidate exceeded overall timeout of {overall_timeout}s across the whole batch")
@@ -740,6 +812,287 @@ class GracefulInterrupt:
         return False  # never swallow an exception (e.g. a forced second Ctrl+C)
 
 
+# ---------- chunk boundary computation ----------
+# Pure functions, no LLM/sandbox involved — support for the chunked
+# curriculum (design doc §2): the trace is processed in chronological
+# chunks, each ending at whichever of three cutoffs comes soonest.
+#
+# Boundary values (`prev_boundary`, the return value, `len(records)`) are
+# all in the same units: a CUMULATIVE ROW COUNT, i.e. "this many rows have
+# been covered so far" — equivalently, a Python slice upper bound, so
+# `records[prev_boundary:next_boundary]` is always exactly the new rows a
+# chunk introduces. This is why a level-completion row at 0-indexed record
+# position `idx` is reported as `idx + 1`, not `idx` — the record at index
+# idx IS the chunk's last (inclusive) row, and idx + 1 rows have been
+# covered through and including it.
+
+def next_level_completion_row(records, prev_boundary):
+    """
+    Scan forward from `prev_boundary` (a cumulative-row-count boundary, so
+    the scan starts at 0-indexed record position `prev_boundary`, the first
+    row not yet covered by any prior chunk) for the first row that itself
+    completes a level.
+
+    Each cleaned record is one transition and carries BOTH endpoints of that
+    transition's levels_completed value — `levels_completed_before` (from
+    that row's pre_observation) and `levels_completed_after` (from its
+    post_observation), per cmd_preprocess's extraction and the same
+    `goal_reached = post_observation.levels_completed >
+    pre_observation.levels_completed` rule used for is_goal certification.
+    A level completes DURING a given row iff that row's own
+    levels_completed_after > levels_completed_before — this is a property
+    of a single record, never a comparison against a neighboring record.
+
+    Returns the cumulative-row-count boundary value for that completion
+    (idx + 1, so it can be used directly as a chunk boundary / slice upper
+    bound — see module note above), or None if no row completes a level
+    anywhere from `prev_boundary` through the end of the trace. A record
+    missing either field is treated as "no signal there" and skipped,
+    rather than raising — not every trace will have this field populated.
+    """
+    for idx in range(prev_boundary, len(records)):
+        rec = records[idx]
+        before = rec.get("levels_completed_before")
+        after = rec.get("levels_completed_after")
+        if before is None or after is None:
+            continue
+        if after > before:
+            return idx + 1
+    return None
+
+
+def next_chunk_boundary(records, prev_boundary, max_examples):
+    """
+    Compute where the next chunk ends, per design doc §2's boundary rule.
+    Three cutoffs compete; whichever is soonest (smallest) wins:
+      - the normal fixed chunk-size cap, prev_boundary + max_examples
+      - the whole-trace cutoff, len(records) — the final chunk may be short
+      - a level cutoff, if a level completes before either of the above
+
+    No minimum chunk size is enforced — if a level completes on the very
+    next row after prev_boundary, the returned boundary can legitimately be
+    prev_boundary + 1. Do not add clamping/merging logic for that case.
+
+    Returns (next_boundary, is_level_boundary). is_level_boundary answers
+    "was THIS boundary (this chunk's own end) produced by a level cutoff?" —
+    it does NOT say anything about whether the chunk that starts after this
+    boundary should get any special prompt treatment (e.g. an EXTEND_TEMPLATE
+    DESCRIPTION note) for having just crossed a level. That's a property of
+    the NEXT chunk, one call later — callers that need it must carry this
+    return value forward themselves with a one-chunk lag; this function only
+    ever describes its own chunk's ending.
+    """
+    candidates = [prev_boundary + max_examples, len(records)]
+    level_row = next_level_completion_row(records, prev_boundary)
+    if level_row is not None:
+        candidates.append(level_row)
+    next_boundary = min(candidates)
+    is_level_boundary = (next_boundary == level_row)  # False if level_row is None
+    return next_boundary, is_level_boundary
+
+
+# ---------- backtest (chunked design): full replay, scoring, goal discounting ----------
+# Step 6 of the chunked-curriculum design (design doc §6, §9). Distinct from
+# score_candidate/summarize_scores above, which remain exactly as-is for the
+# older flat harness (score/evaluate/run-loop) they still serve.
+
+def atomic_write_json(path, data):
+    """
+    Write `data` as JSON to `path` via temp-file-then-os.replace(), so a
+    process interruption mid-write can never leave `path` corrupted or
+    half-written. Shared by run_backtest (row_failure_counts.json) and
+    Step 8's commit/revert snapshot (row_failure_counts_best.json).
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, path)
+    except BaseException:
+        # os.replace itself is atomic, so if we get past it `path` is
+        # guaranteed to hold a complete write, never a partial one -- this
+        # cleanup only matters for failures BEFORE that point (e.g. disk
+        # full while writing the temp file).
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+        raise
+
+
+def load_row_failure_counts(path):
+    """
+    Load the persistent per-row failure-tracking file (design doc §6), or
+    an empty dict if it doesn't exist yet (the very first backtest call of
+    a run). Keys are trace step indices stored as strings (JSON object keys
+    are always strings) -- callers should key lookups with str(step).
+    """
+    path = Path(path)
+    if not path.exists():
+        return {}
+    with open(path) as f:
+        return json.load(f)
+
+
+def actual_goal_for_record(rec):
+    """
+    Ground truth for goal-reached on a single row: levels_completed_after >
+    levels_completed_before, both extracted per-row during preprocessing
+    (Step 4/cmd_preprocess). False if either field is missing -- a trace
+    that never carried levels_completed simply never certifies a goal
+    transition, the same graceful "no signal" treatment as
+    next_level_completion_row uses.
+    """
+    before = rec.get("levels_completed_before")
+    after = rec.get("levels_completed_after")
+    if before is None or after is None:
+        return False
+    return after > before
+
+
+def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
+    """
+    Full teacher-forced replay of records[0:boundary] against candidate_path
+    (Step 3's sequential/stateful runner), scored per design doc §9, with
+    the persistent per-row row_failure_counts.json (design doc §6) read at
+    the start and rewritten at the end.
+
+    Per-row scoring:
+      - A row that crashed, timed out, or was never reached (Step 3's
+        abort-on-crash cut the replay short before this row) always counts
+        as a failure. No grid/goal comparison is attempted for it.
+      - predicted_goal == actual_goal is always required for a pass — both
+        false positives and false negatives count as incorrect, no
+        exemption (design doc §9).
+      - GOAL-DISCOUNTING DECISION (explicit, as Step 6 asks to note in code
+        rather than leave ambiguous): when predicted_goal is True, the grid
+        comparison is EXCLUDED ENTIRELY from the pass/fail decision for
+        that row — not scored-but-flagged. The candidate cannot know the
+        next level's initial grid, so holding a wrong predicted_grid_after
+        against it on a row it itself flagged as a level transition isn't
+        meaningful. Concretely:
+          predicted_goal == True:  passed = (predicted_goal == actual_goal)
+          predicted_goal == False: passed = (predicted_goal == actual_goal)
+                                            and (predicted_grid_after == actual_grid_after)
+
+    Returns:
+      {
+        "accuracy": float,   # exact-match pass rate over THIS call's row range
+        "n_pass": int,
+        "n_total": int,
+        "scored": [...],     # one entry per row, in step order
+        "failures": [...],   # subset of "scored" where passed is False
+        "streak": int,       # longest run of consecutive passed rows, THIS call's replay
+        "counts_path": str,
+      }
+
+    Each "scored" entry is the original record plus "passed" (bool),
+    "predicted_goal", "actual_goal", "goal_discounted" (bool — whether grid
+    comparison was excluded for this row), "prediction" (present whenever a
+    predicted grid exists at all, i.e. no error — regardless of pass/fail,
+    unlike score_candidate's failed-only convention, since a revision
+    prompt may still want a discounted row's prediction later), and
+    "error" (if the row crashed or was never reached).
+
+    row_failure_counts.json is read-mutated-written UNCONDITIONALLY on
+    every call, including rounds a caller later rejects — this function
+    does not know or care about accept/reject. Step 8 owns the
+    commit/revert snapshot (row_failure_counts_best.json) that keeps this
+    file consistent with whichever code is genuinely current-best after
+    each round's decision; do not add that logic here.
+    """
+    row_range = records[:boundary]
+    raw = run_candidate(candidate_path, row_range, **run_kwargs)
+    counts = load_row_failure_counts(counts_path)
+
+    scored = []
+    passed_flags = []
+    for rec in row_range:
+        step_key = str(rec["step"])
+        actual_grid = rec["grid_after"]
+        actual_goal = actual_goal_for_record(rec)
+
+        result = raw.get(rec["step"])
+        if result is None:
+            error = "no result (candidate crashed/timed out earlier in this replay)"
+            predicted_grid, predicted_goal = None, False
+        elif "error" in result:
+            error = result["error"]
+            predicted_grid, predicted_goal = None, False
+        else:
+            error = None
+            predicted_grid = result["prediction"]
+            predicted_goal = bool(result["goal"])
+
+        if error is not None:
+            passed = False
+            goal_discounted = False
+        else:
+            goal_match = (predicted_goal == actual_goal)
+            if predicted_goal:
+                goal_discounted = True  # discounted: grid comparison excluded entirely, see docstring
+                passed = goal_match
+            else:
+                goal_discounted = False
+                passed = goal_match and (predicted_grid == actual_grid)
+
+        entry = {
+            **rec,
+            "passed": passed,
+            "predicted_goal": predicted_goal,
+            "actual_goal": actual_goal,
+            "goal_discounted": goal_discounted,
+        }
+        if predicted_grid is not None:
+            entry["prediction"] = predicted_grid
+        if error is not None:
+            entry["error"] = error
+        scored.append(entry)
+        passed_flags.append(passed)
+
+        if step_key not in counts:
+            # First time this row has ever been part of a backtest replay
+            # (every replay covers 0..boundary, so this only happens once
+            # per row across the whole run) -- actual_grid/actual_goal are
+            # ground truth and never change, so they're set here and never
+            # touched again below.
+            counts[step_key] = {
+                "count": 0,
+                "actual_grid": actual_grid,
+                "actual_goal": actual_goal,
+                "predicted_grid": None,
+                "predicted_goal": None,
+                "error": None,
+            }
+        row_counts = counts[step_key]
+        row_counts["count"] = 0 if passed else row_counts["count"] + 1
+        row_counts["predicted_grid"] = predicted_grid  # overwritten every run, correct or not
+        row_counts["predicted_goal"] = predicted_goal
+        row_counts["error"] = error
+
+    atomic_write_json(counts_path, counts)
+
+    n_total = len(scored)
+    n_pass = sum(passed_flags)
+    accuracy = n_pass / n_total if n_total else 0.0
+
+    longest_streak = 0
+    current_streak = 0
+    for p in passed_flags:
+        current_streak = current_streak + 1 if p else 0
+        longest_streak = max(longest_streak, current_streak)
+
+    return {
+        "accuracy": accuracy,
+        "n_pass": n_pass,
+        "n_total": n_total,
+        "scored": scored,
+        "failures": [s for s in scored if not s["passed"]],
+        "streak": longest_streak,
+        "counts_path": str(counts_path),
+    }
+
+
 # ---------- subcommands ----------
 
 def cmd_inspect(args):
@@ -787,6 +1140,17 @@ def cmd_preprocess(args):
     fallback in case frame ever shows up as a list-of-grids instead of an
     already-collapsed single grid, but for traces from my_agent_keyboard.py it
     should be a no-op since _serialize_frame_for_trace collapses this at write time.
+
+    Also opportunistically pulls levels_completed off both endpoints of each
+    transition (pre_observation.levels_completed / post_observation.levels_completed,
+    under whatever sub-key --levels-key names) into levels_completed_before/
+    levels_completed_after on the cleaned record. A single row's own before/
+    after pair is what next_level_completion_row (chunk boundary computation)
+    and is_goal certification both key off of — goal_reached is exactly
+    levels_completed_after > levels_completed_before for that same row, per
+    design doc §1/§9. Non-fatal if a trace doesn't carry this field (same
+    lenient, best-effort treatment as --score-key below) — pass --levels-key ""
+    to skip the attempt entirely.
     """
     in_path = Path(args.trace)
     out_path = Path(args.out)
@@ -812,6 +1176,20 @@ def cmd_preprocess(args):
                 score = get_nested(rec, args.score_key)
                 if score is not None:
                     clean["score"] = score
+            if args.levels_key:
+                levels_before = get_nested(rec, f"{args.pre_key}.{args.levels_key}")
+                levels_after = get_nested(rec, f"{args.post_key}.{args.levels_key}")
+                # Only set either field if BOTH endpoints are present -- a
+                # record with just one side is missing exactly the
+                # information a before/after comparison needs, so leaving
+                # both off (rather than one real value + one None) keeps
+                # next_level_completion_row's "missing = no signal, skip"
+                # handling correct instead of it silently comparing a real
+                # int against None (which would raise) or treating a
+                # one-sided record as a false completion/non-completion.
+                if levels_before is not None and levels_after is not None:
+                    clean["levels_completed_before"] = levels_before
+                    clean["levels_completed_after"] = levels_after
             out.write(json.dumps(clean) + "\n")
             n = i + 1
     print(f"Wrote {n} cleaned records to {out_path}")
@@ -855,47 +1233,189 @@ def encoding_explanation(encoding):
     return ENCODING_EXPLANATION_RLE if encoding == "rle" else ENCODING_EXPLANATION_HEX
 
 
+DESCRIPTION_INSTRUCTION_COMMON_INTRO = (
+    "Before writing any code, describe the objects in the grid using less than 200 "
+    "words. Note: multiple objects can be of the same type and an object can have "
+    "multiple color values. Also, distinct objects tend to take up less than 20% of "
+    "the grid's values but there are exceptions to this."
+)
+
+DESCRIPTION_INSTRUCTION_TRAILER = (
+    'Write this as a comment/docstring in your class with label "DESCRIPTION:" so it '
+    "carries forward to future revisions."
+)
+
+
+def build_description_instruction(is_extend=False, is_level_boundary=False):
+    """
+    Object-description instruction shown in PROMPT_TEMPLATE/EXTEND_TEMPLATE — never
+    REVISE_TEMPLATE (design doc §4: revision is deliberately scoped tightly to
+    specific failing rows; the model can update DESCRIPTION opportunistically as
+    part of a normal revision without a separately mandated step there).
+
+    PROMPT_TEMPLATE (chunk 1, is_extend=False) gets the 3-step version — there's no
+    prior description to consult yet. EXTEND_TEMPLATE (every chunk after the first,
+    is_extend=True) gets a 4-step version whose new first step asks the model to
+    check its existing DESCRIPTION comment against the new examples before deciding
+    whether it still holds.
+
+    When this EXTEND_TEMPLATE call is for the chunk that starts right after a level
+    completion (is_level_boundary=True — this is the LAGGED value from the
+    PREVIOUS chunk's next_chunk_boundary call, per that function's own docstring
+    and Step 10's one-chunk-lag wiring, never the current chunk's own), an extra,
+    stronger sentence is prepended telling the model explicitly that a new level
+    just started and its persisted DESCRIPTION may no longer apply — stronger than
+    the routine "may already be sufficient, or it may need revising" step 1 language
+    every other EXTEND_TEMPLATE chunk gets, since a new level can introduce a whole
+    new tileset the existing description never accounted for.
+    """
+    if not is_extend:
+        steps = (
+            "There are three steps to accomplishing this task:\n"
+            '1: First, look at the color values in the "Starting Grid". Notice the '
+            "shapes. Notice any objects that stand out with color values different "
+            "from whatever colors dominate most of the grid (background regions).\n"
+            "2: Second, from the changed-cell lists above, notice any objects that "
+            "have moved or changed.\n"
+            "3: Third, you may guess the purpose that each object has in the grid. "
+            'Examples of object purposes are "player-movable object", "goal '
+            'destination for player-movable object", and "object that changes '
+            "another object's shape or color\"."
+        )
+        return f"{DESCRIPTION_INSTRUCTION_COMMON_INTRO} {steps}\n{DESCRIPTION_INSTRUCTION_TRAILER}"
+
+    level_boundary_note = ""
+    if is_level_boundary:
+        level_boundary_note = (
+            "This chunk starts a NEW LEVEL. Your existing DESCRIPTION comment "
+            "describes the previous level's grid and may no longer apply — check it "
+            "against the new grid below rather than assuming it still holds.\n\n"
+        )
+    steps = (
+        "There are four steps to accomplishing this task:\n"
+        '1: First, look at the existing "DESCRIPTION:" comment/docstring in the '
+        "provided class. The description may already be sufficient, or it may need "
+        "revising given the new information above.\n"
+        '2: Second, look at the color values in the "Starting Grid". Notice the '
+        "shapes. Notice any objects that stand out with color values different "
+        "from whatever colors dominate most of the grid (background regions).\n"
+        "3: Third, from the changed-cell lists above, notice any objects that have "
+        "moved or changed.\n"
+        "4: Fourth, you may guess the purpose that each object has in the grid. "
+        'Examples of object purposes are "player-movable object", "goal '
+        'destination for player-movable object", and "object that changes another '
+        "object's shape or color\"."
+    )
+    return f"{level_boundary_note}{DESCRIPTION_INSTRUCTION_COMMON_INTRO} {steps}\n{DESCRIPTION_INSTRUCTION_TRAILER}"
+
+
 PROMPT_TEMPLATE = """You are given a sequence of observed transitions from an ARC-AGI-3 game. \
 Each example shows a grid, an action taken, and the resulting grid.
 
 {encoding_explanation}
 
 Each example below also includes a computed list of exactly which cells changed \
-between grid_before and grid_after, in real integer (row, col): before -> after form. \
+between consecutive grids, in real integer (row, col): before -> after form. \
 Use that list directly to figure out the rule — you do not need to manually compare \
 the two grids cell-by-cell yourself.
 
-Your task: write a single Python function with this exact signature:
+Your task: write a single Python class with this exact shape:
 
-    def predict_next_state(grid: list[list[int]], action: str) -> list[list[int]]:
-        ...
+    class GameModel:
+        def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+            ...
 
-grid is a list of lists of plain integers 0-15 — never the compact display notation \
-shown above, whichever form it takes — and your return value must be in that same \
-form. Infer the transformation rule(s) from the examples below by mentally converting \
-each displayed row back to its real integer list first. Use only the Python standard \
-library — no imports of numpy, scipy, or other third-party packages. Return only the \
-function definition, no explanation, no example usage.
+predict must return a 3-tuple (predicted_grid_after, goal, state):
+  - predicted_grid_after: list[list[int]], your prediction for the grid after taking \
+the given action from grid_before.
+  - goal: bool, True if you predict this action reaches the next level, False otherwise.
+  - state: dict, JSON-serializable (plain dicts/lists/numbers only) — everything you \
+want carried forward into your NEXT predict() call as previous_state. On the very \
+first call of a fresh rollout, previous_state is an empty dict {{}}; your class should \
+handle that starting condition itself (e.g. via previous_state.get(...) with sensible \
+defaults), not assume any particular keys already exist.
 
-Define predict_next_state exactly ONCE. Do not write multiple draft attempts, "actually, \
-let me try again" rewrites, or alternate versions — pick your best hypothesis and write \
-a single, complete, syntactically valid function for it. Every if/elif/else branch and \
-every loop body must contain a real statement (return, assignment, pass, etc.) — never \
-leave a branch with only a comment inside it.
+grid_before is always a list of lists of plain integers 0-15 — never the compact \
+display notation shown above, whichever form it takes — and predicted_grid_after must \
+be in that same form. Infer the transformation rule(s) from the examples below by \
+mentally converting each displayed row back to its real integer list first. Your class \
+may define as many additional methods/fields as it needs; only predict's signature is \
+fixed. Use only the Python standard library or numpy — no other third-party packages. \
+Return only the class definition, no explanation, no example usage.
+
+Define GameModel exactly ONCE, and define each of its methods exactly ONCE. Do not \
+write multiple draft attempts, "actually, let me try again" rewrites, or alternate \
+versions — pick your best hypothesis and write a single, complete, syntactically valid \
+class for it. Every if/elif/else branch and every loop body must contain a real \
+statement (return, assignment, pass, etc.) — never leave a branch with only a comment \
+inside it.
 
 State your hypothesis about the transformation rule ONCE, briefly, as a short comment. \
 Do not re-examine the same examples repeatedly or restate your reasoning multiple \
 times — if your first hypothesis doesn't perfectly fit every example, write your best \
-guess anyway and move on. You will see counterexamples and get a chance to fix mistakes \
-in a later revision round, so an imperfect-but-complete function now is far more useful \
-than a perfect rule you never finish writing.
+guess anyway and move on. You will see new examples and counterexamples and get a \
+chance to fix mistakes in later rounds, so an imperfect-but-complete class now is far \
+more useful than a perfect rule you never finish writing.
 
 {examples}
 
-Reminder: predict_next_state takes and returns plain Python int grids at runtime, \
-never the display notation used above to show you the examples.
+{description_instruction}
 
-Write predict_next_state now.
+Reminder: predict() takes and returns plain Python int grids at runtime, never the \
+display notation used above to show you the examples.
+
+Write your GameModel class now.
+"""
+
+EXTEND_TEMPLATE = """You are given new, previously-unseen transitions from the SAME ARC-AGI-3 \
+game your class below was already built for. These are NOT failures — your class \
+simply hasn't seen these examples yet. Extend or adjust it so it also correctly \
+handles them, WITHOUT rewriting it from scratch.
+
+Here is your current class:
+
+```python
+{candidate_code}
+```
+
+{encoding_explanation}
+
+Each example below also includes a computed list of exactly which cells changed \
+between consecutive grids, in real integer (row, col): before -> after form. \
+Use that list directly to figure out the rule — you do not need to manually compare \
+the two grids cell-by-cell yourself.
+
+{examples}
+
+{description_instruction}
+
+Your predict method must keep this exact signature:
+
+    def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+        ...
+
+returning (predicted_grid_after, goal, state) exactly as before — see your class's own \
+docstring above for what each element means if you need a reminder. grid_before is \
+always a list of lists of plain integers 0-15 — never the compact display notation \
+shown above, whichever form it takes — and predicted_grid_after must be in that same \
+form. Use only the Python standard library or numpy — no other third-party packages. \
+Return only the full, updated class definition, no explanation, no example usage.
+
+Define GameModel exactly ONCE, and define each of its methods exactly ONCE — extend or \
+adjust the existing methods/fields shown above rather than writing multiple draft \
+attempts, "actually, let me try again" rewrites, or alternate versions of the whole \
+class. Every if/elif/else branch and every loop body must contain a real statement \
+(return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
+
+State what you changed, if anything, ONCE, briefly, as a short comment. Do not \
+re-examine the same examples repeatedly or restate your reasoning multiple times — \
+write your best update and move on, even if it's imperfect. You'll get revision rounds \
+later if something is still wrong.
+
+Reminder: predict() takes and returns plain Python int grids at runtime, never the \
+display notation used above to show you the examples.
+
+Write your updated GameModel class now.
 """
 
 REVISE_TEMPLATE = """Your previous candidate for predict_next_state got some transitions wrong. \
@@ -935,24 +1455,85 @@ never the display notation used above to show you the examples.
 """
 
 
-def build_examples_block(records, encoding="hex"):
-    """Format cleaned records as '### Example N' blocks for a synthesis prompt."""
-    blocks = []
-    for i, rec in enumerate(records):
-        changes = diff_grid(rec["grid_before"], rec["grid_after"])
-        blocks.append(
-            f"### Example {i + 1}\n"
-            f"action: {rec['action']}\n"
-            f"grid_before:\n{encode_grid(rec['grid_before'], encoding)}\n"
-            f"grid_after:\n{encode_grid(rec['grid_after'], encoding)}\n"
-            f"changed cells (grid_before -> grid_after), computed for you — real int "
-            f"values, not display notation:\n{format_diff(changes)}\n"
+def build_examples_block(records, encoding="hex", is_extend=False):
+    """
+    Render a contiguous batch of records as one continuous replay, not
+    independent snapshots (design doc §4): the full encoded grid is shown
+    exactly once (`Starting Grid`), and every subsequent example is shown
+    only as a diff against the immediately preceding one — a full grid for
+    every example is redundant, since each subsequent starting grid is just
+    the previous example's resulting grid, already fully implied by the
+    previous example's diff.
+
+    `is_extend` controls only the one extra "not the game's start" sentence
+    (PROMPT_TEMPLATE calls with is_extend=False, EXTEND_TEMPLATE with
+    is_extend=True) — everything else is shared. This function backs the
+    round-1/extend path only; build_counterexamples_block (REVISE_TEMPLATE)
+    is unchanged and continues showing full predicted/actual grid pairs per
+    counterexample, since a counterexample's whole purpose is the
+    predicted-vs-actual comparison, not a contiguous replay.
+
+    Precondition: `records` must be genuinely contiguous —
+    records[i]["grid_before"] == records[i-1]["grid_after"] for every i > 0
+    — since the diff labels ("Grid i-1 -> Grid i") assume it. True by
+    construction for a chunk's round-1 batch (chronological, no shuffle);
+    asserted explicitly below rather than silently trusted, since a silent
+    violation here would produce a prompt that's internally inconsistent
+    without ever raising an error.
+    """
+    assert records, "build_examples_block requires at least one record"
+    for i in range(1, len(records)):
+        assert records[i]["grid_before"] == records[i - 1]["grid_after"], (
+            f"build_examples_block requires contiguous records: record {i - 1} "
+            f"(step {records[i - 1]['step']})'s grid_after does not match record {i} "
+            f"(step {records[i]['step']})'s grid_before. Pass a genuinely contiguous "
+            f"chunk batch, not a sampled/shuffled subset."
         )
-    return "\n".join(blocks)
+
+    lines = [
+        "The examples below form one continuous sequence, not independent snapshots.",
+        '"Starting Grid" is the earliest state in this batch.',
+    ]
+    if is_extend:
+        lines.append(
+            "Starting Grid here is NOT the start of the game — it is only the first "
+            "state in this particular batch of new examples. Earlier trace history "
+            "exists before it; rely on your class's own carried-forward state/"
+            "description for anything from before this batch."
+        )
+    lines.append(f"\nStarting Grid:\n{encode_grid(records[0]['grid_before'], encoding)}\n")
+
+    prev_label = "Starting Grid"
+    for i, rec in enumerate(records, start=1):
+        label = f"Grid {i}"
+        changes = diff_grid(rec["grid_before"], rec["grid_after"])
+        block = (
+            f"\n### {label} (trace step {rec['step']})\n"
+            f"action: {rec['action']}\n"
+            f"changed cells ({prev_label} -> {label}):\n{format_diff(changes)}\n"
+        )
+        if len(changes) > DIFF_MAX_CELLS:
+            block += (
+                f"\n{label} in full (shown because too many cells changed to list "
+                f"individually):\n{encode_grid(rec['grid_after'], encoding)}\n"
+            )
+        lines.append(block)
+        prev_label = label
+    return "\n".join(lines)
 
 
 def spread_sample(records, max_examples):
-    """Evenly-spaced subsample across the whole list (not just the first N)."""
+    """
+    Evenly-spaced subsample across the whole list (not just the first N).
+
+    SUPERSEDED for round-1 prompt building under the chunked curriculum
+    (design doc §2) — build_initial_prompt now takes chunk 1 as the trace's
+    first max_examples rows in chronological order instead, since
+    build_examples_block's contiguity precondition requires it (an
+    evenly-spaced sample isn't contiguous and would trip that assertion).
+    Left defined, unused by build_initial_prompt, only in case any other
+    legacy caller still depends on the old flat-harness sampling behavior.
+    """
     if not max_examples or len(records) <= max_examples:
         return records
     step = len(records) / max_examples
@@ -961,12 +1542,41 @@ def spread_sample(records, max_examples):
 
 
 def build_initial_prompt(records, max_examples, encoding="hex"):
-    sampled = spread_sample(records, max_examples)
+    """
+    Chunk 1's round-1 prompt. Under the chunked curriculum (design doc §2),
+    chunk 1 is simply the trace's first max_examples rows in chronological
+    order — see spread_sample's docstring for why this is no longer an
+    evenly-spaced subsample across the whole trace.
+    """
+    sampled = records[:max_examples]
     prompt = PROMPT_TEMPLATE.format(
         encoding_explanation=encoding_explanation(encoding),
-        examples=build_examples_block(sampled, encoding=encoding),
+        examples=build_examples_block(sampled, encoding=encoding, is_extend=False),
+        description_instruction=build_description_instruction(is_extend=False),
     )
     return prompt, len(sampled)
+
+
+def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_boundary=False):
+    """
+    Round-1 prompt for every chunk after the first (design doc §4). Shows
+    the candidate's current class in full plus only this chunk's newly
+    introduced rows — not the whole trace-so-far, which would defeat the
+    point of a bounded per-chunk prompt.
+
+    is_level_boundary must be the LAGGED value from the PREVIOUS chunk's
+    next_chunk_boundary call (Step 4/Step 10's one-chunk lag), never this
+    chunk's own not-yet-relevant is_level_boundary — see
+    build_description_instruction's docstring for why.
+    """
+    return EXTEND_TEMPLATE.format(
+        candidate_code=candidate_code.strip(),
+        encoding_explanation=encoding_explanation(encoding),
+        examples=build_examples_block(new_records, encoding=encoding, is_extend=True),
+        description_instruction=build_description_instruction(
+            is_extend=True, is_level_boundary=is_level_boundary
+        ),
+    )
 
 
 def build_counterexamples_block(counterexamples, encoding="hex"):
@@ -1034,39 +1644,101 @@ def extract_code(text):
     return m.group(1).strip() if m else text.strip()
 
 
-def keep_first_function_def(source, func_name="predict_next_state"):
+def keep_first_function_def(source, class_name="GameModel"):
     """
-    If the candidate source contains multiple top-level `def predict_next_state`
-    definitions — a recurring failure mode where the model writes an attempt,
-    then "actually, let me reconsider..." and rewrites it again, sometimes
-    several times, each version emptier/more hedged than the last (down to
-    bare `pass` placeholders) — keep only the FIRST complete definition and
-    drop everything from the start of any subsequent redefinition onward.
+    Generalized from an earlier single-function version to work against the
+    class-based candidate contract (a top-level `class GameModel: ...` with
+    a `predict` method and whatever other helper methods/fields the model
+    adds — see design doc's candidate contract).
 
-    This matters because Python itself doesn't error on the duplicate defs;
-    each `def` simply rebinds the name, so whichever one is LAST in the file
-    is the only one ever actually called — and in every case observed so
-    far, the last attempt is the most degraded one, not the best one. Without
-    this trim, run_candidate has been silently scoring the model's worst
-    attempt each round while its better (if still wrong) first attempt gets
-    thrown away for free. Returns (trimmed_source, num_defs_found).
+    Handles two independent degrading-redraft failure modes — the model
+    writes an attempt, then "actually, let me reconsider..." and rewrites
+    it again, sometimes several times, each version emptier/more hedged
+    than the last (down to bare `pass` placeholders):
+
+      1. Multiple top-level `class GameModel` redefinitions in the same
+         response — keep the first complete class, drop everything from
+         the start of the second redefinition onward (this also discards
+         any trailing "final answer" prose after it, same as before).
+      2. Multiple `def` definitions of the same method name *inside* the
+         kept class's body (e.g. two `def predict(...)` in one class) —
+         within the kept class, keep only the first definition of each
+         duplicated method name, trimming just those extra method bodies
+         out of the class while leaving every other method/field untouched.
+
+    Python doesn't error on either kind of duplicate; each `class`/`def`
+    simply rebinds the name, so whichever definition is LAST is the only
+    one ever actually used at runtime — and in every case observed so far,
+    the last attempt is the most degraded one, not the best one. Without
+    this trim, run_candidate would silently score the model's worst
+    attempt each round while a better (if still wrong) first attempt gets
+    thrown away for free.
+
+    Returns (trimmed_source, num_defs_found), where num_defs_found is the
+    combined count of extra top-level class redefinitions plus extra
+    in-class method redefinitions found (0 if the source was already
+    clean).
     """
     import ast
     try:
         tree = ast.parse(source)
     except SyntaxError:
-        return source, 1  # let the caller's own ast.parse (check_ast_imports) raise this normally
+        return source, 0  # let the caller's own ast.parse (check_ast_imports) raise this normally
 
-    matches = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == func_name]
-    if len(matches) <= 1:
-        return source, len(matches)
+    class_matches = [n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name]
+    if not class_matches:
+        return source, 0
 
-    first = matches[0]
     lines = source.splitlines(keepends=True)
+    num_defs_found = len(class_matches) - 1  # extra top-level class redefinitions, dropped wholesale
+
+    first_class = class_matches[0]
     # ast's end_lineno is 1-indexed and inclusive; slicing to it keeps
-    # everything through the end of the first function's body and drops
-    # every subsequent redefinition (plus any trailing "final answer" prose).
-    return "".join(lines[:first.end_lineno]), len(matches)
+    # everything through the end of the first class's body and drops every
+    # subsequent full-class redefinition (plus any trailing "final answer"
+    # prose), exactly as the original single-function version did.
+    trimmed_source = "".join(lines[:first_class.end_lineno])
+
+    # Second pass: look for duplicate method defs *within* the kept class.
+    # Re-parse the trimmed source so all line numbers below are relative to
+    # it (the class's own lineno/end_lineno don't shift from the first
+    # parse since nothing before it was touched, but re-parsing keeps this
+    # robust rather than relying on that).
+    trimmed_tree = ast.parse(trimmed_source)
+    trimmed_class = next(
+        n for n in trimmed_tree.body
+        if isinstance(n, ast.ClassDef) and n.name == class_name
+    )
+
+    methods_by_name = {}
+    for node in trimmed_class.body:
+        if isinstance(node, ast.FunctionDef):
+            methods_by_name.setdefault(node.name, []).append(node)
+
+    duplicate_methods = {name: nodes for name, nodes in methods_by_name.items() if len(nodes) > 1}
+    if not duplicate_methods:
+        return trimmed_source, num_defs_found
+
+    num_defs_found += sum(len(nodes) - 1 for nodes in duplicate_methods.values())
+
+    # Every duplicate method definition after the first one for its name
+    # gets dropped, by line range (including its own decorators, if any).
+    drop_ranges = []
+    for nodes in duplicate_methods.values():
+        for extra in nodes[1:]:
+            start = extra.lineno
+            if extra.decorator_list:
+                start = min(d.lineno for d in extra.decorator_list)
+            drop_ranges.append((start, extra.end_lineno))
+
+    trimmed_lines = trimmed_source.splitlines(keepends=True)
+    keep_mask = [True] * len(trimmed_lines)
+    for start, end in drop_ranges:
+        for i in range(start - 1, end):  # convert 1-indexed inclusive to 0-indexed
+            keep_mask[i] = False
+
+    final_source = "".join(line for line, keep in zip(trimmed_lines, keep_mask) if keep)
+    return final_source, num_defs_found
 
 
 def call_llm_openai(api_base, model, prompt, temperature=0.2, max_tokens=4096,
@@ -1205,6 +1877,44 @@ def cmd_revise_prompt(args):
           f"(rough 1-token/char fallback estimate — no tokenizer loaded on this path), "
           f"{len(counterexamples)} counterexamples"
           + (" [RLE-compact grid encoding]" if args.compact else " [hex grid encoding]"))
+
+
+def cmd_backtest(args):
+    """
+    Standalone CLI wrapper around run_backtest, mainly for manual testing/
+    debugging outside the full chunked run-loop (Step 10 wires run_backtest
+    directly into that loop without going through this command).
+
+    Exit 0 if the replay is fully clean (zero failing rows), exit 1
+    otherwise. This is a simpler convention than the older evaluate
+    command's 0/1/2 — there's no fixed accuracy threshold to check here;
+    per-chunk accept/reject against a baseline is Step 8's epsilon
+    comparison, not this command's job.
+    """
+    with open(args.trace) as f:
+        records = [json.loads(l) for l in f if l.strip()]
+    boundary = args.boundary if args.boundary is not None else len(records)
+
+    result = run_backtest(
+        args.candidate, records, boundary, args.counts,
+        cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
+        per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout,
+    )
+
+    print(f"{args.candidate} vs {args.trace}[0:{boundary}]: "
+          f"{result['n_pass']}/{result['n_total']} passed ({result['accuracy']:.1%}), "
+          f"longest streak {result['streak']}")
+    print(f"row_failure_counts written to {result['counts_path']}")
+
+    if args.out:
+        Path(args.out).write_text("\n".join(json.dumps(s) for s in result["scored"]) + "\n")
+        print(f"Wrote per-row results to {args.out}")
+
+    if result["failures"]:
+        print(f"{len(result['failures'])} failing row(s).")
+        sys.exit(1)
+    print("Replay fully clean (zero failing rows).")
+    sys.exit(0)
 
 
 def cmd_score(args):
@@ -1478,6 +2188,12 @@ def main():
     p_pre.add_argument("--frame-key", default="frame")
     p_pre.add_argument("--action-key", default="action")
     p_pre.add_argument("--score-key", default=None)
+    p_pre.add_argument("--levels-key", default="levels_completed",
+                        help="Sub-key of pre/post observation dicts holding the level counter, "
+                             "extracted into levels_completed_before/levels_completed_after on "
+                             "each cleaned record (needed by chunk boundary computation and "
+                             "is_goal certification). On by default; pass --levels-key \"\" to "
+                             "skip extraction if a trace doesn't carry this field.")
     p_pre.set_defaults(func=cmd_preprocess)
 
     p_split = sub.add_parser("split", help="Chronological 70/30 split into history / held-out")
@@ -1501,6 +2217,23 @@ def main():
                            help="Run-length-encode grid rows (e.g. '0*7 3*2') instead of "
                                 "one hex char per cell — cuts tokens a lot for large/sparse grids")
     p_prompt.set_defaults(func=cmd_prompt)
+
+    p_backtest = sub.add_parser("backtest", help="Full teacher-forced replay + scoring for the "
+                                                  "chunked design (Step 6), class-based candidates only")
+    p_backtest.add_argument("candidate", help="Path to a .py file defining class GameModel with a predict method")
+    p_backtest.add_argument("trace", help="Cleaned jsonl trace file (chronological, no shuffle)")
+    p_backtest.add_argument("--boundary", type=int, default=None,
+                             help="Replay records[0:boundary] (default: the whole trace)")
+    p_backtest.add_argument("--counts", default="row_failure_counts.json",
+                             help="Path to the persistent per-row failure-tracking file (read+rewritten)")
+    p_backtest.add_argument("--out", default=None, help="Write per-row scored results here")
+    p_backtest.add_argument("--cpu-seconds", type=int, default=10)
+    p_backtest.add_argument("--max-procs", type=int, default=16,
+                             help="RLIMIT_NPROC cap for the candidate subprocess (per-UID, not per-tree)")
+    p_backtest.add_argument("--mem-mb", type=int, default=512)
+    p_backtest.add_argument("--per-call-seconds", type=int, default=2)
+    p_backtest.add_argument("--overall-timeout", type=int, default=60)
+    p_backtest.set_defaults(func=cmd_backtest)
 
     p_score = sub.add_parser("score", help="Sandboxed test of a candidate against any dataset")
     p_score.add_argument("candidate", help="Path to a .py file defining predict_next_state(grid, action) -> grid")
