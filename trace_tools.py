@@ -549,6 +549,20 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
         r = json.loads(line)
         if "step" in r:
             results[r["step"]] = r
+        elif "error" in r:
+            # RUNNER_TEMPLATE prints exactly this shape (no "step" key) for
+            # the two failures that happen BEFORE the per-row loop even
+            # starts -- class_name not defined in the candidate at all, or
+            # defined but failed to instantiate -- since there's no `rec`
+            # in scope yet at that point to attach a step to. Surfacing it
+            # here as a real, loud RuntimeError instead of silently
+            # dropping it matters: without this, every row would instead
+            # report the generic, WRONG "no result (candidate crashed/timed
+            # out earlier in this replay)" (see run_backtest), completely
+            # hiding that the actual cause was "no usable class was ever
+            # defined" -- a 0%-accuracy round with no visible explanation,
+            # not a crash, so nothing would stop the run to surface it.
+            raise RuntimeError(f"candidate runner failed before processing any rows: {r['error']}")
     return results
 
 
@@ -720,11 +734,15 @@ def pause_for_confirmation(label, path):
 
 class GracefulInterrupt:
     """
-    Context manager for the risky span of a round: the LLM call, candidate
-    extraction/write, sandboxed backtest, and log write — the operations
-    that are either expensive to redo (an LLM generation that can take
-    minutes on local GPU inference) or briefly touch disk in a way that's
-    safer to let finish than to abort mid-write.
+    Context manager for the risky span of a round that's actually wrapped in
+    practice: the LLM call plus candidate extraction/write (see
+    make_round_builder) — the one part of a round that's genuinely expensive
+    to redo (an LLM generation that can take minutes on local GPU
+    inference). It does NOT cover the backtest that follows or the log
+    write at the end of a chunk — both happen later, outside any `with
+    GracefulInterrupt()` block, in run_chunk_rounds/cmd_run_chunked. See
+    "If a Ctrl+C lands during the backtest instead" below for what that
+    actually means in practice; it's a real gap, just a bounded one.
 
     First Ctrl+C inside the `with` block: caught here, NOT re-raised. Sets
     `.requested = True` and prints a message, then returns control to
@@ -757,6 +775,27 @@ class GracefulInterrupt:
     partial chunk state that leaves is the same disk-consistency guarantee
     described above: no file involved is ever left half-written, only
     possibly missing.
+
+    If a Ctrl+C lands during the backtest instead (i.e. after this class's
+    `with` block has already exited): there's no graceful handling at all
+    at that point — it's an ordinary KeyboardInterrupt, uncaught anywhere in
+    the call chain, which crashes cmd_run_chunked immediately with a raw
+    traceback instead of the clean "STOP: interrupted after chunk N
+    completed" message a Ctrl+C during the LLM call gets. The actual
+    consequences are bounded, though: row_failure_counts.json is written in
+    one shot at the very end of a successful run_backtest call (see
+    atomic_write_json), so an interrupt mid-backtest never corrupts it or
+    leaves it half-updated — it's simply untouched this round, exactly as
+    it was after the previous round/chunk. What's actually lost is the
+    CURRENT chunk's in-memory progress (every round completed so far within
+    that one chunk) — every chunk before it already has its
+    chunk{N}_final.py and chunk_log.jsonl entry safely persisted, since
+    those are only written after a chunk fully finishes. There's no
+    resume/checkpoint feature in this harness regardless of where a Ctrl+C
+    lands, though, so recovering from this means restarting run-chunked
+    from chunk 1 either way — this gap only changes HOW abruptly that
+    happens (a crash instead of a clean stop), not whether you can pick up
+    partway through.
     """
 
     def __init__(self):
@@ -1254,6 +1293,25 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
                 "prev_best_accuracy": prev_best_accuracy, "threshold": threshold,
                 "n_pass": result["n_pass"], "n_total": result["n_total"], "streak": result["streak"],
             })
+            # The code we just reverted BACK TO might independently already
+            # be zero-failure -- this can only happen via a baseline
+            # recompute (the one accepted state never itself checked against
+            # the early-stop condition below, since baseline recomputes are
+            # deliberately exempt from it) that this round's rejected
+            # revision attempt failed to improve on. It's a fact about the
+            # REVERTED-TO state, not about `result` (this round's own
+            # candidate, which -- since a zero-failure round is always
+            # accepted, never rejected -- must have had failures of its
+            # own). Checked explicitly, right here, so a next round is never
+            # even attempted against a target that already has nothing left
+            # to fix -- catching it here means build_revise_prompt can never
+            # be asked to build a revision prompt with zero counterexamples
+            # to show.
+            reverted_counts = load_row_failure_counts(counts_path)
+            if not any(entry.get("count", 0) > 0 for entry in reverted_counts.values()):
+                early_stopped = True
+                log.append({"event": "early_stop", "round": round_n, "rounds_skipped": max_rounds - round_n})
+                break
 
         if not result["failures"]:  # zero failing rows across the FULL chunk row range this round
             early_stopped = True
@@ -2366,9 +2424,15 @@ def build_llm_caller(args):
         def _tokenize(prompt):
             # Raw tokenize() undercounts vs. what create_chat_completion actually
             # sends, since the chat template adds role markers/special tokens on
-            # top of the raw text — pad the estimate a bit so the preflight check
+            # top of the raw text — pad the estimate so the preflight check
             # errs toward catching a too-tight fit rather than missing one.
-            return len(llm.tokenize(prompt.encode("utf-8")))
+            # CHAT_TEMPLATE_TOKEN_PADDING is a generous fixed guess at that
+            # overhead (role delimiters, BOS/EOS, etc.), not measured against
+            # this specific model's real chat template — cheap insurance
+            # given the alternative is a raw mid-generation context-overflow
+            # error instead of this preflight's own clear message.
+            CHAT_TEMPLATE_TOKEN_PADDING = 64
+            return len(llm.tokenize(prompt.encode("utf-8"))) + CHAT_TEMPLATE_TOKEN_PADDING
 
         return _call, _tokenize
 
@@ -2485,19 +2549,51 @@ FALLBACK_CANDIDATE_CODE = '''class GameModel:
 '''
 
 
-def _validate_candidate_code(code, round_label):
+def _defines_class_method(tree, class_name, method_name):
+    """
+    True iff `tree` (an already-parsed ast.Module) contains a class named
+    class_name with a method named method_name anywhere in its body,
+    scanning the WHOLE tree (ast.walk) rather than just the top level --
+    consistent with check_ast_imports' own whole-tree scanning style. Not a
+    check on the method's runtime behavior (a class whose __init__ crashes,
+    or whose predict() has the wrong signature, still passes this) -- just
+    the static shape every template explicitly asks for ("Define GameModel
+    exactly ONCE" with a `predict` method).
+    """
+    import ast
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            for item in node.body:
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)) and item.name == method_name:
+                    return True
+    return False
+
+
+def _validate_candidate_code(code, round_label, class_name="GameModel", method_name="predict"):
     """
     Best-effort preflight validation of this round's extracted candidate
     code, run BEFORE it ever reaches run_chunk_rounds -> run_backtest ->
     run_candidate -- none of which have (or need) their own defensive
     handling for genuinely malformed code, since up to now every caller
     controlled its own test fixtures. Real LLM output is exactly the case
-    that needs this: a truncated generation (SyntaxError) or a disallowed
-    import (ValueError from check_ast_imports) would otherwise propagate
-    up through run_chunk_rounds uncaught and crash the entire multi-chunk
-    run over one bad round. Both are substituted with FALLBACK_CANDIDATE_CODE
-    instead -- a real, always-parseable, always-safe class that just scores
-    low rather than crashing anything.
+    that needs this: a truncated generation (SyntaxError), a disallowed
+    import (ValueError from check_ast_imports), or code that's syntactically
+    fine but never actually defines a usable class_name/method_name (e.g.
+    the extracted text turned out to be prose or an unrelated snippet, not
+    the model's real answer -- see extract_code's docstring for how that can
+    happen) would otherwise either crash the run or silently run a
+    guaranteed-0%-accuracy round with a misleading "no result (crashed/timed
+    out)" error on every single row (see run_candidate's RUNNER_TEMPLATE
+    parsing), never revealing the real cause. All three are substituted
+    with FALLBACK_CANDIDATE_CODE instead -- a real, always-parseable,
+    always-safe class that just scores low rather than crashing anything or
+    hiding what actually went wrong.
+
+    This only checks STATIC shape (does a class_name class with a
+    method_name method exist anywhere in the tree), not runtime behavior --
+    a class whose __init__ raises, or whose predict() takes the wrong
+    arguments, passes this check and still surfaces later, as a loud
+    RuntimeError out of run_candidate (deliberately not caught, see below).
 
     Deliberately does NOT catch RuntimeError/OSError here (an actual
     subprocess/sandbox infrastructure failure, as opposed to a bad
@@ -2505,10 +2601,12 @@ def _validate_candidate_code(code, round_label):
     absorbing an infra problem into a fake low-accuracy round would hide
     something that actually needs attention during a real GPU run.
     """
+    import ast
     try:
-        import ast as _ast
-        _ast.parse(code)
+        tree = ast.parse(code)
         check_ast_imports(code)
+        if not _defines_class_method(tree, class_name, method_name):
+            raise ValueError(f"no class {class_name!r} with a {method_name!r} method found in the extracted code")
         return code
     except (SyntaxError, ValueError) as e:
         print(f"{round_label}: candidate failed validation ({type(e).__name__}: {e}); "
@@ -2553,7 +2651,17 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
                 round_label = f"Chunk {chunk_number} Round {round_n}: Extend Prompt"
         else:
             row_failure_counts = load_row_failure_counts(counts_path)
-            prompt_text = build_revise_prompt(current_best_code, row_failure_counts, k=args.k, encoding=encoding)
+            # Clamp against TOTAL rows tracked (not just currently-failing
+            # ones) -- select_top_k_failures already handles "k exceeds the
+            # number of currently-failing rows" gracefully on its own (a
+            # plain list slice, never raises), so this clamp exists solely
+            # to keep --k from tripping build_revise_prompt's separate
+            # misconfiguration guard (k > total rows ever tracked), which a
+            # genuinely small early chunk (fewer rows than --k) can hit
+            # under perfectly ordinary conditions -- not a sign anything's
+            # actually wrong.
+            effective_k = min(args.k, len(row_failure_counts))
+            prompt_text = build_revise_prompt(current_best_code, row_failure_counts, k=effective_k, encoding=encoding)
             round_label = f"Chunk {chunk_number} Round {round_n}: Revision Prompt"
 
         prompt_path = workdir / f"chunk{chunk_number}_prompt_round{round_n}.txt"
@@ -2619,10 +2727,33 @@ def cmd_run_chunked(args):
     workdir.mkdir(parents=True, exist_ok=True)
     counts_path = workdir / "row_failure_counts.json"
     best_counts_path = workdir / "row_failure_counts_best.json"
+    log_path = (workdir / args.log if args.log and not os.path.isabs(args.log) else Path(args.log)) if args.log else None
 
     if args.max_examples < 1:
         raise SystemExit("--max-examples must be at least 1 (used as the chunk-size cutoff; "
                           "0 or negative would never advance the chunk boundary and loop forever)")
+    if args.max_rounds < 1:
+        raise SystemExit(f"--max-rounds must be at least 1 (got {args.max_rounds}) -- chunk 1 with 0 "
+                          f"rounds would never produce any code at all, since even the seed prompt is "
+                          f"round 1.")
+
+    # Refuse a dirty --workdir rather than silently mixing this run's
+    # results with a previous run's leftovers: row_failure_counts.json
+    # would get read-mutated-written on top of stale counts from whatever
+    # ran here before, and the log would end up with duplicate/overlapping
+    # chunk numbers from two unrelated runs concatenated together -- neither
+    # failure is a crash, both are silently wrong-looking results, which is
+    # worse than refusing to start.
+    preexisting = [p for p in (counts_path, best_counts_path, log_path) if p is not None and p.exists()]
+    if preexisting:
+        preexisting_list = "\n  ".join(str(p) for p in preexisting)
+        raise SystemExit(
+            f"Refusing to start: --workdir '{workdir}' already contains file(s) from a previous run:\n"
+            f"  {preexisting_list}\n\n"
+            f"Starting into a dirty workdir would silently mix this run's results with the old one's.\n\n"
+            f"To fix: either pass a fresh --workdir for this run, or if you really do want to overwrite "
+            f"the previous run, delete/move the file(s) listed above first."
+        )
 
     with open(args.trace) as f:
         records = [json.loads(l) for l in f if l.strip()]
@@ -2661,8 +2792,7 @@ def cmd_run_chunked(args):
         )
 
         report_chunk(chunk_number, prev_boundary, boundary, chunk_result, args.max_rounds)
-        if args.log:
-            log_path = workdir / args.log if not os.path.isabs(args.log) else Path(args.log)
+        if log_path is not None:
             report = build_chunk_report(chunk_number, prev_boundary, boundary, chunk_result, args.max_rounds)
             with open(log_path, "a") as f:
                 f.write(json.dumps(report) + "\n")
