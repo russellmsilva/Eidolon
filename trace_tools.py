@@ -280,7 +280,25 @@ def build_bwrap_command(python_exe, runner_path_in_sandbox, staging_dir):
         "--ro-bind", conda_prefix, conda_prefix,
         "--ro-bind", staging_dir, "/work",
         "--chdir", "/work",
-        "--tmpfs", "/tmp",
+        # Deliberately no writable location anywhere in the sandbox. An
+        # earlier version mounted `--tmpfs /tmp` for general scratch space,
+        # but the candidate contract (predict() is a pure function: input
+        # via stdin, output via stdout/return value, never touches disk)
+        # has no legitimate need for one, and a writable /tmp is exactly
+        # what lets an allowed-but-untrusted library like numpy write
+        # arbitrarily large files via numpy.save()/ndarray.tofile()/
+        # memmap() -- calls that use numpy's OWN internal open(), not the
+        # candidate's restricted builtins (see RUNNER_TEMPLATE), so no
+        # Python-level restriction can catch them. RLIMIT_FSIZE would cap
+        # any single write but still allow it to happen; not creating a
+        # writable inode anywhere removes the capability at the mount
+        # level instead, which no library-internal code path can route
+        # around. --dev below does NOT implicitly create a writable
+        # /dev/shm (that needs its own explicit --tmpfs), so this closes
+        # the other common "second /tmp" people forget to check for.
+        # Every remaining path in this sandbox is either read-only
+        # (/usr, /lib, /bin, the conda env, /work) or a namespaced
+        # synthetic filesystem with no general write surface (/proc, /dev).
         "--proc", "/proc",
         "--dev", "/dev",
         "--cap-drop", "ALL",
@@ -310,6 +328,108 @@ def describe(obj, path="root", max_depth=6, depth=0):
         describe(obj[0], f"{path}[0]", max_depth, depth + 1)
     else:
         print(f"{indent}{path}: {type(obj).__name__}")
+
+
+MAX_CANDIDATE_OUTPUT_BYTES = 64 * 1024 * 1024  # 64MB across one whole
+# sequential run-loop invocation (all rows in one `backtest`/round). Far
+# more than any real ARC grid trace needs, but small enough to actually
+# bound host memory pressure from a runaway or malicious candidate.
+
+
+def run_with_output_cap(exec_cmd, stdin_data, env, overall_timeout,
+                         max_output_bytes=MAX_CANDIDATE_OUTPUT_BYTES):
+    """
+    Like `subprocess.run(capture_output=True, timeout=overall_timeout)`,
+    but also kills the child and stops reading once total stdout+stderr
+    crosses max_output_bytes.
+
+    `capture_output=True` alone buffers output with no size limit at all.
+    That's fine for a well-behaved candidate, but run_candidate replays
+    every row of a chunk in ONE subprocess invocation (see the runner's
+    per-row loop in RUNNER_TEMPLATE) — a candidate that prints a
+    chunky-but-legal JSON line every row can accumulate far more total
+    output than its own RLIMIT_AS over the course of a long replay, since
+    each row's data is written to the pipe and freed before the next row
+    is produced; the process's resident memory never has to hold more
+    than one row's worth at a time even as cumulative output climbs into
+    the hundreds of MB. RLIMIT_AS bounds a snapshot, not a running total,
+    so it does not catch this. This does, by tracking bytes actually read
+    off the pipe and killing the child immediately once the cap is
+    crossed, from two reader threads (stdout, stderr) that run
+    concurrently with waiting on the process so a candidate blocked on a
+    full pipe buffer can't stall out the overall_timeout enforcement below.
+
+    Returns an object with .returncode, .stdout, .stderr — the subset of
+    subprocess.run's result run_candidate actually uses. Raises
+    subprocess.TimeoutExpired on timeout, matching subprocess.run's own
+    behavior, so callers don't need to change their except clause.
+    """
+    import threading
+
+    proc = subprocess.Popen(
+        exec_cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, env=env,
+    )
+
+    chunks = {"stdout": [], "stderr": []}
+    total_bytes = 0
+    killed_for_size = False
+    lock = threading.Lock()
+
+    def _reader(stream, key):
+        nonlocal total_bytes, killed_for_size
+        try:
+            for chunk in iter(lambda: stream.read(65536), ""):
+                if not chunk:
+                    break
+                with lock:
+                    chunks[key].append(chunk)
+                    total_bytes += len(chunk.encode("utf-8", errors="ignore"))
+                    over_cap = total_bytes > max_output_bytes
+                if over_cap and not killed_for_size:
+                    killed_for_size = True
+                    proc.kill()
+                    break
+        except (ValueError, OSError):
+            pass  # stream closed under us because the process was killed
+
+    t_out = threading.Thread(target=_reader, args=(proc.stdout, "stdout"))
+    t_err = threading.Thread(target=_reader, args=(proc.stderr, "stderr"))
+    t_out.start()
+    t_err.start()
+
+    try:
+        if stdin_data:
+            proc.stdin.write(stdin_data)
+        proc.stdin.close()
+    except (BrokenPipeError, OSError):
+        pass  # candidate process may have already exited or been killed
+
+    try:
+        proc.wait(timeout=overall_timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+        t_out.join(timeout=5)
+        t_err.join(timeout=5)
+        raise subprocess.TimeoutExpired(exec_cmd, overall_timeout)
+
+    t_out.join(timeout=5)
+    t_err.join(timeout=5)
+
+    class _Result:
+        pass
+
+    result = _Result()
+    result.returncode = proc.returncode
+    result.stdout = "".join(chunks["stdout"])
+    result.stderr = "".join(chunks["stderr"])
+    if killed_for_size:
+        result.stderr += (
+            f"\n[host] candidate output exceeded {max_output_bytes} bytes "
+            f"across this run; process was killed."
+        )
+    return result
 
 
 # ---------- sandboxed candidate execution ----------
@@ -352,7 +472,7 @@ def check_ast_imports(source):
 
 
 RUNNER_TEMPLATE = """
-import sys, json, resource, signal
+import sys, json, resource, signal, builtins as _builtins_module
 
 resource.setrlimit(resource.RLIMIT_CPU, ({cpu}, {cpu}))
 resource.setrlimit(resource.RLIMIT_AS, ({mem_bytes}, {mem_bytes}))
@@ -369,7 +489,45 @@ def _timeout_handler(signum, frame):
     raise TimeoutError("candidate exceeded per-call time budget")
 signal.signal(signal.SIGALRM, _timeout_handler)
 
-candidate_globals = {{"__name__": "candidate", "__builtins__": __builtins__}}
+# Restrict the builtins visible inside the candidate's OWN exec()'d
+# namespace. check_ast_imports only inspects `import`/`from` statements at
+# the host level, so it never sees a candidate reaching for the same
+# capability through a bare builtin instead: open('/etc/passwd'),
+# __import__('os'), eval(...), exec(...), compile(...). Everything except
+# __import__ is safe to delete outright, since nothing in ordinary
+# candidate code calls them implicitly -- a candidate that never wrote
+# `eval` in its source will never invoke it by accident. __import__ is
+# different: CPython's IMPORT_NAME bytecode op calls builtins.__import__
+# under the hood for EVERY `import` statement, including the ones on
+# ALLOWED_IMPORTS the candidate is supposed to have (numpy, copy,
+# itertools, ...) -- deleting it outright would break every legitimate
+# import too. So it's wrapped with the same allowlist check instead of
+# removed, closing the __import__('os')-style bypass while leaving
+# `import numpy` working.
+#
+# This is a courtesy filter for a careless candidate, not the real
+# security boundary -- bwrap's namespace/capability isolation is (see
+# build_bwrap_command). A determined adversary already inside this
+# process can still reach live module objects through class-introspection
+# gadgets that never touch __builtins__ at all (e.g. walking
+# ().__class__.__mro__[-1].__subclasses__() to find an object whose type
+# already has `os` bound in its closure, since numpy's own import graph
+# pulls `os` into this process regardless of what candidate code does).
+# Nothing at the Python level can close that; only the sandbox can.
+_ALLOWED_IMPORTS_RUNTIME = set({allowed_imports!r})
+_real_import = _builtins_module.__import__
+
+def _guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+    if name.split(".")[0] not in _ALLOWED_IMPORTS_RUNTIME:
+        raise ImportError(f"import of {{name!r}} is not allowed in a candidate")
+    return _real_import(name, globals, locals, fromlist, level)
+
+_safe_builtins = dict(vars(_builtins_module))
+_safe_builtins["__import__"] = _guarded_import
+for _name in ("open", "eval", "exec", "compile", "input", "breakpoint", "exit", "quit"):
+    _safe_builtins.pop(_name, None)
+
+candidate_globals = {{"__name__": "candidate", "__builtins__": _safe_builtins}}
 with open({candidate_path!r}) as f:
     source = f.read()
 exec(compile(source, {candidate_path!r}, "exec"), candidate_globals)
@@ -480,7 +638,7 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
             cpu=cpu_seconds, mem_bytes=mem_mb * 1024 * 1024,
             candidate_path=runner_candidate_path,
             per_call_seconds=per_call_seconds, max_procs=max_procs,
-            class_name=class_name,
+            class_name=class_name, allowed_imports=sorted(ALLOWED_IMPORTS),
         )
 
         if use_sandbox:
@@ -526,9 +684,8 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
             "NUMEXPR_NUM_THREADS": "1",
         }
         try:
-            proc = subprocess.run(
-                exec_cmd, input=stdin_data, capture_output=True, text=True,
-                timeout=overall_timeout, env=sandbox_env,
+            proc = run_with_output_cap(
+                exec_cmd, stdin_data, sandbox_env, overall_timeout,
             )
         except subprocess.TimeoutExpired:
             raise RuntimeError(f"candidate exceeded overall timeout of {overall_timeout}s across the whole batch")
@@ -961,6 +1118,37 @@ def actual_goal_for_record(rec):
     return after > before
 
 
+def grid_shape_error(grid):
+    """
+    Return a short reason string if `grid` isn't a well-formed grid (a
+    non-empty list of non-empty, equal-length rows of plain ints), else
+    None. A candidate's predict() has no fixed return-type enforcement --
+    it could hand back a ragged list, a numpy array, a list containing
+    None/str cells, etc. Without this check, that malformed value would
+    ride along as "prediction" all the way to encode_grid when a later
+    revision prompt gets built (see cmd_revise_prompt/build_prompt), where
+    it fails as an unrelated-looking exception deep in prompt construction
+    instead of a clear per-row result here. Called right after a
+    prediction is pulled out of the runner's stdout, so a malformed
+    prediction is scored exactly like a crashed/timed-out row -- a
+    failure, not a crash of the whole backtest.
+    """
+    if not isinstance(grid, list) or not grid:
+        return "prediction is not a non-empty list of rows"
+    width = None
+    for row in grid:
+        if not isinstance(row, list) or not row:
+            return "a row is not a non-empty list"
+        for cell in row:
+            if not isinstance(cell, int) or isinstance(cell, bool):
+                return "a row contains a non-int cell"
+        if width is None:
+            width = len(row)
+        elif len(row) != width:
+            return "rows have inconsistent width"
+    return None
+
+
 def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
     """
     Full teacher-forced replay of records[0:boundary] against candidate_path
@@ -1030,9 +1218,14 @@ def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
             error = result["error"]
             predicted_grid, predicted_goal = None, False
         else:
-            error = None
             predicted_grid = result["prediction"]
             predicted_goal = bool(result["goal"])
+            shape_error = grid_shape_error(predicted_grid)
+            if shape_error:
+                error = f"malformed prediction: {shape_error}"
+                predicted_grid = None
+            else:
+                error = None
 
         if error is not None:
             passed = False
