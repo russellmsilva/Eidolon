@@ -8,7 +8,8 @@ Pipeline:
                      Specifically checks whether the frame field is a single grid
                      per record or an accumulating list-of-frames.
   2. preprocess     Collapse each record down to {step, action, grid_before,
-                     grid_after, levels_completed_before/after} — one cleaned
+                     grid_after, levels_completed_before/after,
+                     available_actions_before} — one cleaned
                      transition per observation, dropping any redundant
                      history the raw FrameData carries.
   3. prompt         Build chunk 1's seed prompt (PROMPT_TEMPLATE) from the
@@ -196,12 +197,7 @@ def encode_grid(grid, encoding="hex"):
     return grid_to_compact(grid)
 
 
-# Above roughly this many changed cells, listing every one individually stops
-# helping and starts costing tokens for little benefit (a genuinely global
-# transformation — e.g. every cell shifts — produces a diff as big as the
-# grid itself). Past that point we just report the count and let the model
-# fall back to the full before/after grids shown alongside the diff.
-DIFF_MAX_CELLS = 40
+HEX_DIGITS = "0123456789abcdef"
 
 
 def diff_grid(grid_before, grid_after):
@@ -226,14 +222,125 @@ def diff_grid(grid_before, grid_after):
     return changes
 
 
-def format_diff(changes, max_cells=DIFF_MAX_CELLS):
-    """Render a diff_grid() result as a compact 'row,col: before -> after' list."""
-    if not changes:
-        return "no cells changed (identity transformation for this example)"
-    if len(changes) > max_cells:
-        return (f"{len(changes)} cells changed — too many to list individually here; "
-                f"compare the full before/after grids above instead")
+def format_flat_diff(changes):
+    """
+    Render a diff_grid() result as a 'row,col: before -> after' list, one
+    changed cell per line, real integer values throughout (never the
+    hex/RLE display shorthand — see ENCODING_EXPLANATION_HEX/RLE, which
+    only ever describes how full GRIDS are shown, not this list).
+    """
     return "\n".join(f"(row {r}, col {c}): {b} -> {a}" for r, c, b, a in changes)
+
+
+def format_masked_diff(changes, shape_grid):
+    """
+    Render a diff_grid() result as a "masked grid": one line per row of
+    `shape_grid` (used only for its dimensions), with runs of identical
+    consecutive cells RLE-compressed — both unchanged runs ("*N": N
+    consecutive cells that didn't change) and changed-value runs
+    ("before>after*N": N consecutive cells that all changed from the same
+    before value to the same after value). A single, non-repeated changed
+    cell is just "before>after" with no "*1" suffix — the suffix only
+    appears once a run has 2+ cells, since a bare "before>after" is
+    already unambiguous on its own. All values use hex digits (the same
+    0-15 alphabet ENCODING_EXPLANATION_HEX already describes for grids),
+    never real integers — this is fundamentally a grid-shaped format, and
+    mixing real integers into a grid-shaped context would be more
+    confusing than staying consistent with how every other grid in the
+    prompt is shown.
+
+    Exists alongside format_flat_diff as the second of two candidates
+    format_diff picks between — see format_diff's docstring for why picking
+    dynamically beats a fixed cell-count threshold. This representation
+    wins specifically when a diff is sparse (few changed cells scattered
+    across a mostly-unchanged grid): the RLE runs collapse long unchanged
+    OR uniformly-changed stretches to a few characters each, which a flat
+    per-cell list cannot do, while still preserving the 2D spatial layout
+    of what changed (a flat list of (row, col) pairs doesn't show a moving
+    object's shape the way a masked grid naturally does).
+
+    Deliberately does NOT also RLE-compress runs of identical ROW STRINGS
+    (e.g. many consecutive "*64" rows collapsing to one "*64 x40" line) —
+    that's a real further reduction (measured independently), but adds a
+    second, distinct compression axis for the model to track correctly on
+    top of this one, and its benefit is shape-dependent in a way this
+    per-row compression isn't (a curved/irregular moving object's own rows
+    rarely repeat exactly, even though the background surrounding it
+    usually does). Holding off on that specific addition until there's a
+    concrete signal that prompt format complexity — as opposed to model
+    capability — is actually the bottleneck worth spending it on.
+    """
+    changed = {(r, c): (b, a) for r, c, b, a in changes}
+    lines = []
+    for r, row in enumerate(shape_grid):
+        # First pass: one raw token per cell (None for unchanged, else the
+        # "before>after" hex pair) — kept separate from the RLE pass below
+        # so the same run-collapsing logic applies uniformly to both kinds
+        # of run instead of needing two different code paths.
+        raw_tokens = []
+        for c in range(len(row)):
+            if (r, c) in changed:
+                b, a = changed[(r, c)]
+                raw_tokens.append(f"{HEX_DIGITS[b]}>{HEX_DIGITS[a]}")
+            else:
+                raw_tokens.append(None)
+
+        tokens = []
+        i = 0
+        while i < len(raw_tokens):
+            j = i
+            while j < len(raw_tokens) and raw_tokens[j] == raw_tokens[i]:
+                j += 1
+            run_len = j - i
+            if raw_tokens[i] is None:
+                tokens.append(f"*{run_len}")
+            elif run_len > 1:
+                tokens.append(f"{raw_tokens[i]}*{run_len}")
+            else:
+                tokens.append(raw_tokens[i])
+            i = j
+        lines.append(" ".join(tokens))
+    return "\n".join(lines)
+
+
+def format_diff(changes, shape_grid):
+    """
+    Render a diff_grid() result using whichever of two candidate formats is
+    actually shorter for THIS specific diff: format_flat_diff (a real-int
+    per-cell list) or format_masked_diff (a masked grid with RLE-compressed
+    unchanged runs). Returns (format_name, text) — callers embed
+    format_name inline next to the diff so each block is self-describing
+    regardless of which format won, rather than relying on the model to
+    remember a single "sometimes it looks like X, sometimes like Y"
+    explanation from earlier in a long prompt.
+
+    Deliberately NOT a fixed cell-count threshold (the previous design,
+    DIFF_MAX_CELLS): measured against a real 400-row ls20 trace, the
+    crossover point between these two formats turned out to depend on
+    things a fixed number can't capture — grid dimensions (format_masked_diff's
+    per-row "*N" overhead scales with grid height), and how clustered vs.
+    scattered the changes are (RLE compresses clustered changes far better
+    than scattered ones). Comparing actual rendered length per diff is
+    cheap (plain string-length comparisons, not model calls) and is
+    correct by construction for any game's grid size and change pattern,
+    with no per-game tuning required.
+
+    shape_grid must be a grid the same shape as the one the diff was
+    computed against (grid_after for a normal before/after transition
+    diff; the correct/actual grid for a build_revise_row_block prediction-
+    vs-correct diff) — only its dimensions are used, not its values (every
+    changed cell's actual before/after values already come from `changes`
+    itself).
+    """
+    if not changes:
+        return "flat", "no cells changed (identity transformation for this example)"
+    flat = format_flat_diff(changes)
+    masked = format_masked_diff(changes, shape_grid)
+    if len(masked) < len(flat):
+        return "masked-grid", masked
+    return "flat-list", flat
+
+
 
 
 def build_bwrap_command(python_exe, runner_path_in_sandbox, staging_dir):
@@ -1256,13 +1363,18 @@ def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
         if step_key not in counts:
             # First time this row has ever been part of a backtest replay
             # (every replay covers 0..boundary, so this only happens once
-            # per row across the whole run) -- actual_grid/actual_goal are
-            # ground truth and never change, so they're set here and never
-            # touched again below.
+            # per row across the whole run) -- actual_grid/actual_goal/
+            # available_actions_before are ground truth and never change,
+            # so they're set here and never touched again below.
+            # available_actions_before uses .get() rather than direct
+            # indexing since older cleaned traces (preprocessed before
+            # --actions-key existed) won't carry this key at all --
+            # format_row_available_actions handles a None gracefully.
             counts[step_key] = {
                 "count": 0,
                 "actual_grid": actual_grid,
                 "actual_goal": actual_goal,
+                "available_actions_before": rec.get("available_actions_before"),
                 "predicted_grid": None,
                 "predicted_goal": None,
                 "error": None,
@@ -1777,6 +1889,19 @@ def cmd_preprocess(args):
     Non-fatal if a trace doesn't carry this field (same lenient,
     best-effort treatment as --score-key below) — pass --levels-key "" to
     skip the attempt entirely.
+
+    Same treatment for available_actions (pre_observation.available_actions,
+    under --actions-key) into available_actions_before — the raw legal-
+    action-set integers reported by the game itself (e.g. [1, 2, 3, 4]) at
+    the state this row's action was chosen from, used by
+    format_chunk_action_vocabulary and format_row_available_actions to
+    tell the model what actions are actually available rather than
+    leaving it to infer the action space from which strings happen to
+    appear in a given prompt's examples. Before-only, not also
+    post_observation's side: nothing in the harness consults an "after"
+    value (it would describe the NEXT row's decision point, not this
+    row's), so there's nothing to gain from pulling and persisting it.
+    Pass --actions-key "" to skip.
     """
     in_path = Path(args.trace)
     out_path = Path(args.out)
@@ -1816,6 +1941,10 @@ def cmd_preprocess(args):
                 if levels_before is not None and levels_after is not None:
                     clean["levels_completed_before"] = levels_before
                     clean["levels_completed_after"] = levels_after
+            if args.actions_key:
+                actions_before = get_nested(rec, f"{args.pre_key}.{args.actions_key}")
+                if actions_before is not None:
+                    clean["available_actions_before"] = actions_before
             out.write(json.dumps(clean) + "\n")
             n = i + 1
     print(f"Wrote {n} cleaned records to {out_path}")
@@ -1840,6 +1969,119 @@ run-length notation — it always works with real Python integers."""
 
 def encoding_explanation(encoding):
     return ENCODING_EXPLANATION_RLE if encoding == "rle" else ENCODING_EXPLANATION_HEX
+
+
+def format_available_actions(action_ids):
+    """
+    Render a set of raw available_actions integers -- as they appear
+    directly in a trace row's pre_observation/post_observation (e.g.
+    [1, 2, 3, 4]) -- into the same "GameAction.ACTIONN" string format the
+    cleaned record's own "action" field already uses (e.g.
+    "GameAction.ACTION1"), so the two read as the same vocabulary in a
+    prompt instead of two superficially unrelated ones.
+
+    This assumes the trace's integer IDs line up 1:1 with ACTION{n} (true
+    for every ls20 row inspected so far). An ID that doesn't fit that
+    scheme (0 is RESET, not a mid-episode action, and wouldn't appear in a
+    mid-trace row's available_actions anyway) is rendered as a raw literal
+    rather than guessed at, so a genuine surprise in the data shows up as
+    an odd-looking token instead of being silently mapped to the wrong
+    action.
+    """
+    rendered = []
+    for a in sorted(set(action_ids)):
+        if isinstance(a, int) and a >= 1:
+            rendered.append(f"GameAction.ACTION{a}")
+        else:
+            rendered.append(str(a))
+    return ", ".join(rendered)
+
+
+def format_chunk_action_vocabulary(records):
+    """
+    Action-vocabulary note for PROMPT_TEMPLATE/EXTEND_TEMPLATE, built from
+    each row's available_actions_before -- the game's own reported legal-
+    action set at the state the row's action was chosen FROM, i.e. ground
+    truth for what this row's own decision point looked like -- rather
+    than inferred from which "action" strings happen to occur in a sampled
+    batch. Scoped to the CURRENT CHUNK's records only (never the whole
+    trace) -- see build_initial_prompt/build_extend_prompt's call sites.
+
+    Deliberately available_actions_before only, not also _after: _after is
+    already the NEXT row's decision point (or, on a chunk's last row, past
+    the transition entirely -- see next_chunk_boundary), so folding it in
+    here was answering a question this note was never meant to answer.
+    Dropping it also removes the one guaranteed source of disagreement a
+    chunk could show (a level-completing last row's _after already
+    reflecting the next level's action set) -- see format_row_available_actions
+    for where a row's transition-relative available actions still matter.
+
+    Two output shapes, chosen by comparing each row's available_actions_before
+    against every other row's in the chunk:
+      - Uniform (expected to be the near-universal case now): every row
+        agrees, so the note states the action set plainly, with no hedging.
+      - Non-uniform (should be rare-to-nonexistent for a well-formed
+        trace): rows disagree, so the note names the superset and warns
+        the model not to assume every row shares it. Per
+        next_chunk_boundary/next_level_completion_row, a chunk never
+        knowingly spans two levels -- but that guarantee depends on
+        levels_completed_before/after being populated; a trace with gaps
+        in that field (next_level_completion_row silently skips rows it's
+        missing on) could let an undetected level transition land inside
+        one chunk, or a game could simply change its own available
+        actions mid-level. This branch exists to surface that rather than
+        silently assert a uniformity that didn't hold.
+
+    Falls back to a plain notice when the cleaned records don't carry
+    available_actions_before at all (e.g. a trace preprocessed before
+    --actions-key existed, or preprocessed with --actions-key "").
+    """
+    row_sets = []
+    for rec in records:
+        before = rec.get("available_actions_before")
+        if before is None:
+            continue
+        row_sets.append(set(before))
+
+    if not row_sets:
+        return (
+            "(Available-actions data not present for this chunk -- the cleaned "
+            "trace doesn't carry available_actions_before. Infer the action "
+            "vocabulary from whatever action values appear in the examples below.)"
+        )
+
+    ids = set()
+    for row_ids in row_sets:
+        ids |= row_ids
+
+    uniform = all(row_ids == row_sets[0] for row_ids in row_sets)
+    if uniform:
+        return f"The actions available for this chunk of examples are: {format_available_actions(ids)}."
+
+    return (
+        f"The superset of actions available for this chunk of examples is "
+        f"{format_available_actions(ids)}, but some examples do not have all these "
+        f"actions available to them. Infer the action vocabulary from whatever "
+        f"action values appear in the examples below."
+    )
+
+
+def format_row_available_actions(available_actions_before):
+    """
+    Per-counterexample "available actions for this row" line for
+    REVISE_TEMPLATE, sourced from that row's own available_actions_before
+    (row_failure_counts.json entries carry this once it's persisted at
+    first-scoring time -- see run_backtest) rather than from a single
+    aggregated note, since counterexamples are typically drawn from all
+    across the trace-so-far and different rows can legitimately have
+    different legal action sets (e.g. rows from different levels).
+
+    Falls back to a plain notice for counts files persisted before this
+    field existed, rather than a broken/missing line.
+    """
+    if available_actions_before is None:
+        return "(available actions not recorded for this row)"
+    return f"available actions for this row: {format_available_actions(available_actions_before)}"
 
 
 DESCRIPTION_INSTRUCTION_COMMON_INTRO = (
@@ -1890,7 +2132,8 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
             "3: Third, you may guess the purpose that each object has in the grid. "
             'Examples of object purposes are "player-movable object", "goal '
             'destination for player-movable object", and "object that changes '
-            "another object's shape or color\"."
+            "another object's shape or color\" (these are just examples — there may "
+            "be other kinds of objects/purposes)."
         )
         return f"{DESCRIPTION_INSTRUCTION_COMMON_INTRO} {steps}\n{DESCRIPTION_INSTRUCTION_TRAILER}"
 
@@ -1914,7 +2157,8 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
         "4: Fourth, you may guess the purpose that each object has in the grid. "
         'Examples of object purposes are "player-movable object", "goal '
         'destination for player-movable object", and "object that changes another '
-        "object's shape or color\"."
+        "object's shape or color\" (these are just examples — there may be other "
+        "kinds of objects/purposes)."
     )
     return f"{level_boundary_note}{DESCRIPTION_INSTRUCTION_COMMON_INTRO} {steps}\n{DESCRIPTION_INSTRUCTION_TRAILER}"
 
@@ -1924,10 +2168,7 @@ Each example shows a grid, an action taken, and the resulting grid.
 
 {encoding_explanation}
 
-Each example below also includes a computed list of exactly which cells changed \
-between consecutive grids, in real integer (row, col): before -> after form. \
-Use that list directly to figure out the rule — you do not need to manually compare \
-the two grids cell-by-cell yourself.
+{action_vocabulary}
 
 Your task: write a single Python class with this exact shape:
 
@@ -1941,16 +2182,18 @@ the given action from grid_before.
   - goal: bool, True if you predict this action reaches the next level, False otherwise.
   - state: dict, JSON-serializable (plain dicts/lists/numbers only) — everything you \
 want carried forward into your NEXT predict() call as previous_state. On the very \
-first call of a fresh rollout, previous_state is an empty dict {{}}; your class should \
-handle that starting condition itself (e.g. via previous_state.get(...) with sensible \
-defaults), not assume any particular keys already exist.
+first call of a fresh rollout, previous_state is an empty dict {{}}. Your class must \
+not raise a KeyError on that call — use previous_state.get("your_key", <default>) \
+instead of previous_state["your_key"]. Store whatever state you choose to track under \
+keys of your own choosing, but don't assume any of them already exist the first time \
+predict() runs.
 
 grid_before is always a list of lists of plain integers 0-15 — never the compact \
 display notation shown above, whichever form it takes — and predicted_grid_after must \
 be in that same form. Infer the transformation rule(s) from the examples below by \
 mentally converting each displayed row back to its real integer list first. Your class \
 may define as many additional methods/fields as it needs; only predict's signature is \
-fixed. Use only the Python standard library or numpy — no other third-party packages. \
+fixed. You may only import: copy, itertools, math, collections, functools, and numpy — no other modules, standard library or third-party. \
 Return only the class definition, no explanation, no example usage.
 
 Define GameModel exactly ONCE, and define each of its methods exactly ONCE. Do not \
@@ -1960,12 +2203,27 @@ class for it. Every if/elif/else branch and every loop body must contain a real 
 statement (return, assignment, pass, etc.) — never leave a branch with only a comment \
 inside it.
 
-State your hypothesis about the transformation rule ONCE, briefly, as a short comment. \
 Do not re-examine the same examples repeatedly or restate your reasoning multiple \
 times — if your first hypothesis doesn't perfectly fit every example, write your best \
 guess anyway and move on. You will see new examples and counterexamples and get a \
 chance to fix mistakes in later rounds, so an imperfect-but-complete class now is far \
 more useful than a perfect rule you never finish writing.
+
+Following the "Starting Grid", each example's changed cells are shown in whichever \
+of three formats is most compact for that specific example — every example names \
+its own format inline, so read that name and apply the matching rule below rather \
+than assuming all examples use the same one:
+  - "flat-list" format: one changed cell per line, "(row, col): before -> after", \
+real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex.
+  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
+the next N cells in that row are unchanged from the previous grid. "b>c" is a single \
+changed cell, hex digit before -> after (same 0-15 hex alphabet the color legend \
+above uses for grids — NOT real integers here, opposite of flat-list format). \
+"b>c*N" means the next N cells all made that SAME before->after change — do not \
+read it as N separate different changes, it is N cells that all changed identically.
+  - "in full": the whole resulting grid, same compact display format as the Starting \
+Grid above (hex/RLE per the encoding note) — used when showing the entire grid is \
+itself the most compact option, e.g. most of the grid changed at once.
 
 {examples}
 
@@ -1990,10 +2248,23 @@ Here is your current class:
 
 {encoding_explanation}
 
-Each example below also includes a computed list of exactly which cells changed \
-between consecutive grids, in real integer (row, col): before -> after form. \
-Use that list directly to figure out the rule — you do not need to manually compare \
-the two grids cell-by-cell yourself.
+{action_vocabulary}
+
+Following the "Starting Grid", each example's changed cells are shown in whichever \
+of three formats is most compact for that specific example — every example names \
+its own format inline, so read that name and apply the matching rule below rather \
+than assuming all examples use the same one:
+  - "flat-list" format: one changed cell per line, "(row, col): before -> after", \
+real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex.
+  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
+the next N cells in that row are unchanged from the previous grid. "b>c" is a single \
+changed cell, hex digit before -> after (same 0-15 hex alphabet the color legend \
+above uses for grids — NOT real integers here, opposite of flat-list format). \
+"b>c*N" means the next N cells all made that SAME before->after change — do not \
+read it as N separate different changes, it is N cells that all changed identically.
+  - "in full": the whole resulting grid, same compact display format as the Starting \
+Grid above (hex/RLE per the encoding note) — used when showing the entire grid is \
+itself the most compact option, e.g. most of the grid changed at once.
 
 {examples}
 
@@ -2008,7 +2279,11 @@ returning (predicted_grid_after, goal, state) exactly as before — see your cla
 docstring above for what each element means if you need a reminder. grid_before is \
 always a list of lists of plain integers 0-15 — never the compact display notation \
 shown above, whichever form it takes — and predicted_grid_after must be in that same \
-form. Use only the Python standard library or numpy — no other third-party packages. \
+form. Reminder: backtest always replays your class from row 0, so previous_state \
+still starts as an empty dict {{}} on that very first call regardless of which rows \
+you're looking at here — don't let a change here reintroduce a KeyError on a key \
+that isn't in previous_state yet (use previous_state.get("your_key", <default>) \
+rather than previous_state["your_key"]). You may only import: copy, itertools, math, collections, functools, and numpy — no other modules, standard library or third-party. \
 Return only the full, updated class definition, no explanation, no example usage.
 
 Define GameModel exactly ONCE, and define each of its methods exactly ONCE — extend or \
@@ -2017,7 +2292,7 @@ attempts, "actually, let me try again" rewrites, or alternate versions of the wh
 class. Every if/elif/else branch and every loop body must contain a real statement \
 (return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
 
-State what you changed, if anything, ONCE, briefly, as a short comment. Do not \
+Do not \
 re-examine the same examples repeatedly or restate your reasoning multiple times — \
 write your best update and move on, even if it's imperfect. You'll get revision rounds \
 later if something is still wrong.
@@ -2038,14 +2313,29 @@ current class:
 {encoding_explanation}
 
 {status_notes}
-Each counterexample below shows a row your class has been failing on, comparing your \
-predicted grid_after (when your class produced one) to the correct grid_after, with a \
-computed diff between them — exactly which cells differ, and the correct value vs. \
-what you predicted — in real integer (row, col): your prediction -> correct value \
-form. Use that directly to see where your rule diverges from the truth; you do not \
-need to manually compare grids cell-by-cell yourself. These rows are selected because \
-your class has failed on them most persistently across the WHOLE trace so far, not \
-just the newest rows it's seen:
+Each counterexample below shows a row your class has been failing on: your predicted \
+grid_after in full (when your class produced one — see the diff itself for what to do \
+when it didn't), plus a computed diff against the correct grid — exactly which cells \
+differ, and what the correct value is at each one, in whichever of two formats was \
+more compact for that specific counterexample (each one names its own format inline, \
+so read that name rather than assuming they're all the same). The correct grid_after \
+itself is NOT shown separately — your predicted grid is identical to it at every cell \
+NOT listed in the diff, and the diff gives you the correct value at every cell that \
+IS listed, so nothing is missing by only showing one grid:
+  - "flat-list" format: one differing cell per line, "(row, col): your prediction -> \
+correct", real integer values 0-15 — NOT hex digits.
+  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
+the next N cells in that row match between your prediction and the correct grid. \
+"b>c" is a single differing cell, hex digit your-prediction -> correct (same 0-15 \
+hex alphabet the color legend above uses for grids — NOT real integers here). \
+"b>c*N" means the next N cells all had that SAME your-prediction -> correct mismatch \
+— do not read it as N separate different mismatches, it is N cells that are all \
+wrong in the identical way.
+Use that directly to see where your rule diverges from the truth; you do not need to \
+manually compare grids cell-by-cell yourself. Each counterexample also states \
+its own available actions — the legal action set can differ row to row (e.g. across a \
+level boundary). These rows are selected because your class has failed on them most \
+persistently across the WHOLE trace so far, not just the newest rows it's seen:
 
 {counterexamples}
 
@@ -2060,7 +2350,11 @@ returning (predicted_grid_after, goal, state) exactly as before — see your cla
 docstring above for what each element means if you need a reminder. grid_before is \
 always a list of lists of plain integers 0-15 — never the compact display notation \
 shown above, whichever form it takes — and predicted_grid_after must be in that same \
-form. Use only the Python standard library or numpy — no other third-party packages. \
+form. Reminder: backtest always replays your class from row 0, so previous_state \
+still starts as an empty dict {{}} on that very first call regardless of which rows \
+you're looking at here — don't let a change here reintroduce a KeyError on a key \
+that isn't in previous_state yet (use previous_state.get("your_key", <default>) \
+rather than previous_state["your_key"]). You may only import: copy, itertools, math, collections, functools, and numpy — no other modules, standard library or third-party. \
 Return only the full, updated class definition, no explanation, no example usage.
 
 Define GameModel exactly ONCE, and define each of its methods exactly ONCE — revise or \
@@ -2069,7 +2363,9 @@ attempts, "actually, let me try again" rewrites, or alternate versions of the wh
 class. Every if/elif/else branch and every loop body must contain a real statement \
 (return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
 
-State what you changed, if anything, ONCE, briefly, as a short comment. Do not \
+State what you changed in this revision in under 100 words, as a comment/docstring in \
+your class labeled "REVISION:" — overwrite any previous "REVISION:" block already \
+there rather than appending to it, so only your latest revision notes remain. Do not \
 re-examine the same counterexamples repeatedly or restate your reasoning multiple \
 times — write your best fix and move on, even if it's imperfect. You'll get another \
 revision round later if something is still wrong.
@@ -2090,6 +2386,15 @@ def build_examples_block(records, encoding="hex", is_extend=False):
     is redundant, since each subsequent starting grid is just the previous
     example's resulting grid, already fully implied by the previous
     example's diff.
+
+    Each per-example diff independently picks whichever of three
+    representations renders shortest for THAT specific diff -- format_diff's
+    own flat-list-vs-masked-grid choice, further compared here against a
+    plain full-grid dump. No fixed cell-count threshold: see format_diff's
+    docstring for why a threshold can't generalize across games the way a
+    direct cost comparison does. Every block states inline which format it
+    used, since different examples in the same prompt can legitimately use
+    different ones.
 
     `is_extend` controls only the one extra "not the game's start" sentence
     (PROMPT_TEMPLATE calls with is_extend=False, EXTEND_TEMPLATE with
@@ -2134,15 +2439,28 @@ def build_examples_block(records, encoding="hex", is_extend=False):
     for i, rec in enumerate(records, start=1):
         label = f"Grid {i}"
         changes = diff_grid(rec["grid_before"], rec["grid_after"])
-        block = (
-            f"\n### {label} (trace step {rec['step']})\n"
-            f"action: {rec['action']}\n"
-            f"changed cells ({prev_label} -> {label}):\n{format_diff(changes)}\n"
-        )
-        if len(changes) > DIFF_MAX_CELLS:
-            block += (
-                f"\n{label} in full (shown because too many cells changed to list "
-                f"individually):\n{encode_grid(rec['grid_after'], encoding)}\n"
+        diff_format, diff_text = format_diff(changes, rec["grid_after"])
+        full_dump = encode_grid(rec["grid_after"], encoding)
+
+        header = f"\n### {label} (trace step {rec['step']})\naction: {rec['action']}\n"
+        if changes and len(full_dump) < len(diff_text):
+            # For this specific diff, showing the whole resulting grid is
+            # actually cheaper than any diff representation (this happens
+            # at very high change density, e.g. a level transition where
+            # most of the grid changed at once — masking barely helps when
+            # there's little left to mask, and even a flat list of
+            # thousands of changed cells loses to just showing the grid).
+            block = header + (
+                f"{label} in full ({len(changes)} of {sum(len(r) for r in rec['grid_after'])} "
+                f"cells changed — showing the whole grid was cheaper than any diff "
+                f"representation for this one) — same compact display format as the "
+                f"Starting Grid above, NOT real integers or the masked-grid notation "
+                f"used elsewhere:\n{full_dump}\n"
+            )
+        else:
+            block = header + (
+                f"changed cells ({prev_label} -> {label}), {diff_format} format "
+                f"(see the format note above for how to read this):\n{diff_text}\n"
             )
         lines.append(block)
         prev_label = label
@@ -2159,6 +2477,7 @@ def build_initial_prompt(records, max_examples, encoding="hex"):
     sampled = records[:max_examples]
     prompt = PROMPT_TEMPLATE.format(
         encoding_explanation=encoding_explanation(encoding),
+        action_vocabulary=format_chunk_action_vocabulary(sampled),
         examples=build_examples_block(sampled, encoding=encoding, is_extend=False),
         description_instruction=build_description_instruction(is_extend=False),
     )
@@ -2176,10 +2495,15 @@ def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_bo
     next_chunk_boundary call (the caller carries it forward one chunk),
     never this chunk's own not-yet-relevant is_level_boundary — see
     build_description_instruction's docstring for why.
+
+    action_vocabulary is deliberately derived from new_records alone (this
+    chunk only), not the whole trace — see format_chunk_action_vocabulary's
+    docstring for why that's the intended scope, not a limitation.
     """
     return EXTEND_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
         encoding_explanation=encoding_explanation(encoding),
+        action_vocabulary=format_chunk_action_vocabulary(new_records),
         examples=build_examples_block(new_records, encoding=encoding, is_extend=True),
         description_instruction=build_description_instruction(
             is_extend=True, is_level_boundary=is_level_boundary
@@ -2248,19 +2572,101 @@ def build_revise_status_notes(most_recent_passed):
     )
 
 
+def format_prediction_diff_section(predicted_grid, actual_grid):
+    """
+    Render the "cells where your prediction differs..." section (intro
+    line + diff text) for one row_failure_counts entry, used by both
+    branches of build_revise_row_block that show a predicted-vs-correct
+    diff.
+
+    predicted_grid is None means the candidate's predict() call produced
+    no usable grid at all for this row (crashed, or genuinely returned
+    None) — this is NOT the same thing as an empty diff_grid() result,
+    which means the prediction was a PERFECT match. Piping predicted_grid
+    is None straight through diff_grid()+format_diff() previously produced
+    an empty changes list, which format_diff renders as "no cells changed
+    (identity transformation for this example)" — falsely claiming a
+    flawless prediction that never actually happened. This function exists
+    specifically to keep those two very different situations from
+    rendering as the same sentence.
+
+    Can a genuinely non-None predicted_grid still equal actual_grid
+    exactly here, producing a TRUE "no cells changed" result? Depends
+    entirely on which of build_revise_row_block's branches called this:
+      - Ordinary wrong-transition branch (predicted_goal == actual_goal,
+        both False): PROVABLY IMPOSSIBLE for any row actually selected as
+        a counterexample. run_backtest computes
+        passed = goal_match and (predicted_grid == actual_grid) for this
+        exact case, so an exact grid match together with a goal match
+        would have made the row PASS (count reset to 0) rather than fail
+        — a row only reaches counterexample selection (count > 0) here by
+        having predicted_grid != actual_grid.
+      - False-positive-goal branch (predicted_goal=True, actual_goal=
+        False): genuinely reachable, and meaningful when it happens.
+        goal_discounted=True means passed = goal_match ONLY — the grid
+        comparison is excluded from pass/fail entirely, so a row can fail
+        purely on the goal mismatch while predicted_grid still happens to
+        equal actual_grid exactly. When that happens, "no cells changed"
+        is both true and the single most useful thing this section can
+        say: the grid transformation logic is correct, only the goal-
+        completion heuristic needs fixing.
+      - Missed-level-completion branch never calls this function at all
+        (build_revise_row_block skips the grid diff there entirely).
+    """
+    if predicted_grid is None:
+        return (
+            "no prediction available for this row — predicted_grid was None, so "
+            "there is nothing to diff against the correct grid. This does NOT mean "
+            "your prediction matched; it means predict() didn't return a usable grid "
+            "for this row at all — check for a crash/timeout or an early return "
+            "somewhere in your class.\n"
+        )
+    diff = diff_grid(predicted_grid, actual_grid)
+    diff_format, diff_text = format_diff(diff, actual_grid)
+    return (
+        f"cells where your prediction differs from the correct grid, {diff_format} "
+        f"format (your prediction -> correct):\n{diff_text}\n"
+    )
+
+
+def format_grid_and_diff_section(predicted_grid, actual_grid, encoding):
+    """
+    Render the grid(s) + diff section for one build_revise_row_block
+    counterexample. Shows ONLY the predicted grid in full, not both
+    predicted and correct — the diff already carries "before(predicted)
+    -> after(correct)" at every cell that differs, and is identical to
+    the correct grid at every cell that doesn't, so predicted grid + diff
+    reconstructs the correct grid exactly. Showing both grids in full was
+    pure redundancy that cost a full extra grid dump per counterexample
+    regardless of how small the actual diff was — for k counterexamples
+    that's k full grid dumps saved.
+
+    Falls back to showing the correct grid alone when predicted_grid is
+    None (nothing else to show; format_prediction_diff_section's own "no
+    prediction available" message explains why there's no predicted grid,
+    but the model still needs SOME concrete grid to look at).
+    """
+    if predicted_grid is not None:
+        pred_str = encode_grid(predicted_grid, encoding)
+        return f"your predicted grid_after:\n{pred_str}\n" + format_prediction_diff_section(predicted_grid, actual_grid)
+    return f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n" + format_prediction_diff_section(predicted_grid, actual_grid)
+
+
 def build_revise_row_block(i, step_key, entry, encoding="hex"):
     """
     Render one selected row_failure_counts.json entry as a counterexample.
     Built entirely from the entry's own fields — count, actual_grid/
     actual_goal (ground truth), predicted_grid/predicted_goal/error (most
-    recent attempt) — no grid_before/action are available in this schema,
+    recent attempt), available_actions_before (ground truth, see
+    run_backtest) — no grid_before/action are available in this schema,
     so the diff shown here is between the predicted grid and the correct
     grid directly, not a before/after transition diff.
 
     Three distinct cases:
       - False-positive goal (predicted_goal=True, actual_goal=False):
-        actual_grid is a normal same-level continuation, shown as usual,
-        plus an explicit note that the goal prediction was wrong.
+        actual_grid is a normal same-level continuation; predicted grid +
+        diff shown as usual (see format_grid_and_diff_section), plus an
+        explicit note that the goal prediction was wrong.
       - False-negative goal (predicted_goal=False, actual_goal=True): the
         grid diff is omitted entirely — actual_grid here is the NEXT
         level's starting grid, not a comparable continuation — and the row
@@ -2278,7 +2684,10 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
     predicted_goal = entry.get("predicted_goal")
     error = entry.get("error")
 
-    header = f"### Counterexample {i} (trace step {step_key}, failed {count}x so far)\n"
+    header = (
+        f"### Counterexample {i} (trace step {step_key}, failed {count}x so far)\n"
+        f"{format_row_available_actions(entry.get('available_actions_before'))}\n"
+    )
 
     if error is not None:
         return (
@@ -2289,16 +2698,11 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
         )
 
     if predicted_goal and not actual_goal:
-        pred_str = encode_grid(predicted_grid, encoding) if predicted_grid is not None else "(no grid predicted)"
-        diff = diff_grid(predicted_grid, actual_grid) if predicted_grid is not None else []
         return (
             header
             + "FALSE-POSITIVE goal prediction: you predicted goal=True (level complete) "
               "on this row, but the level did NOT actually complete here.\n"
-            + f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n"
-              f"your predicted grid_after:\n{pred_str}\n"
-              f"cells where your prediction differs from the correct grid, real int "
-              f"values (your prediction -> correct):\n{format_diff(diff)}\n"
+            + format_grid_and_diff_section(predicted_grid, actual_grid, encoding)
         )
 
     if (not predicted_goal) and actual_goal:
@@ -2313,14 +2717,9 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
         )
 
     # Ordinary wrong-transition row: goal correctly predicted False, grid wrong.
-    pred_str = encode_grid(predicted_grid, encoding) if predicted_grid is not None else "(no grid predicted)"
-    diff = diff_grid(predicted_grid, actual_grid) if predicted_grid is not None else []
     return (
         header
-        + f"correct grid_after:\n{encode_grid(actual_grid, encoding)}\n"
-          f"your predicted grid_after:\n{pred_str}\n"
-          f"cells where your prediction differs from the correct grid, real int values "
-          f"(your prediction -> correct):\n{format_diff(diff)}\n"
+        + format_grid_and_diff_section(predicted_grid, actual_grid, encoding)
     )
 
 
@@ -2906,6 +3305,53 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
     return round_builder
 
 
+def validate_cleaned_trace(records, trace_path):
+    """
+    Fail fast if `records` still looks like a RAW trace (pre_observation ->
+    action -> post_observation rows straight from the game harness) rather
+    than the output of `preprocess` (flat {step, action, grid_before,
+    grid_after, ...} rows).
+
+    run-chunked is the expensive, unattended entry point -- it loads a GGUF
+    (or connects to an API backend) and can run for a long time -- so this
+    exists to catch the "forgot to preprocess" mistake before any of that
+    expensive setup happens, rather than partway into chunk 1 when
+    build_examples_block's first KeyError on "grid_before" would otherwise
+    be the only symptom.
+
+    Checks only the first record: it's the trace's FORMAT that's at issue
+    here, not a per-row content problem, and every record in a single trace
+    file comes from the same pipeline stage. Distinguishes "definitely raw"
+    (has pre_observation/post_observation) from "just not cleaned-shaped"
+    (neither raw nor cleaned markers present, e.g. a hand-built or corrupted
+    file) so the error message can point at the actual fix in the common
+    case rather than a generic "something's wrong" message.
+    """
+    first = records[0]
+    if "grid_before" in first and "grid_after" in first:
+        return
+
+    if "pre_observation" in first or "post_observation" in first:
+        raise SystemExit(
+            f"{trace_path} looks like a RAW trace (its first record has "
+            f"'pre_observation'/'post_observation' keys), not a preprocessed one. "
+            f"run-chunked needs the flat {{step, action, grid_before, grid_after, "
+            f"...}} format that `preprocess` produces, not the raw pre_observation -> "
+            f"action -> post_observation rows the game harness writes.\n\n"
+            f"Fix: preprocess this file first, e.g.:\n"
+            f"  python trace_tools.py preprocess {trace_path} <cleaned_output.jsonl>\n"
+            f"then pass <cleaned_output.jsonl> to run-chunked instead."
+        )
+
+    raise SystemExit(
+        f"{trace_path} doesn't look like a preprocessed trace — its first record "
+        f"is missing 'grid_before'/'grid_after'. run-chunked needs the flat "
+        f"{{step, action, grid_before, grid_after, ...}} format that `preprocess` "
+        f"produces; run `preprocess` on the raw trace first, then pass its output "
+        f"to run-chunked."
+    )
+
+
 def cmd_run_chunked(args):
     """
     Fully automated chunked-curriculum loop: loads the whole cleaned trace
@@ -2952,6 +3398,7 @@ def cmd_run_chunked(args):
         records = [json.loads(l) for l in f if l.strip()]
     if not records:
         raise SystemExit(f"{args.trace} contains no records")
+    validate_cleaned_trace(records, args.trace)
 
     run_kwargs = dict(cpu_seconds=args.cpu_seconds, mem_mb=args.mem_mb, max_procs=args.max_procs,
                        per_call_seconds=args.per_call_seconds, overall_timeout=args.overall_timeout)
@@ -3039,6 +3486,13 @@ def main():
                              "each cleaned record (needed by chunk boundary computation and "
                              "is_goal certification). On by default; pass --levels-key \"\" to "
                              "skip extraction if a trace doesn't carry this field.")
+    p_pre.add_argument("--actions-key", default="available_actions",
+                        help="Sub-key of pre_observation holding the raw legal-action-set list "
+                             "(e.g. [1, 2, 3, 4]), extracted into available_actions_before on "
+                             "each cleaned record (used by the prompt templates' "
+                             "action_vocabulary note and per-counterexample available-actions "
+                             "line). On by default; pass --actions-key \"\" to skip extraction "
+                             "if a trace doesn't carry this field.")
     p_pre.set_defaults(func=cmd_preprocess)
 
     p_prompt = sub.add_parser("prompt", help="Build the chunk-1 seed prompt from a records file")

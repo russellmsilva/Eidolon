@@ -69,7 +69,7 @@ counts2["9"] = {
 prompt = tt.build_revise_prompt("class GameModel:\n    pass\n", counts2, k=5, encoding="hex")
 
 assert "def predict(self, grid_before" in prompt
-assert "Use only the Python standard library or numpy" in prompt
+assert "You may only import: copy, itertools, math, collections, functools, and numpy" in prompt
 assert "GameModel class now" in prompt
 assert "predict_next_state" not in prompt  # old single-function contract must be fully gone
 
