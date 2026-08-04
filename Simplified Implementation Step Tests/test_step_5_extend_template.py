@@ -5,7 +5,6 @@ from trace_tools import (
     build_description_instruction,
     build_initial_prompt,
     build_extend_prompt,
-    DIFF_MAX_CELLS,
 )
 
 
@@ -17,10 +16,20 @@ def check(label, condition):
 all_ok = True
 
 
-def make_records(n, start_step=21):
-    """n contiguous records, each just incrementing one cell so diffs stay small."""
+def make_records(n, start_step=21, size=20):
+    """
+    n contiguous records, each just incrementing one cell so diffs stay
+    small. Uses a 20x20 base grid (not the original 2x2) -- under the
+    current dynamic format selection (see format_diff), a diff's cost is
+    compared against a full-grid dump's cost, and a full dump of a 2x2
+    grid is only ~6 chars, cheaper than ANY diff notation for ANY diff
+    size on a grid that small. A 2x2 grid can no longer exercise the
+    "ordinary small diff stays a flat list" path at all; 20x20 (~420 chars
+    to dump raw) is large enough that a 1-2 cell diff genuinely stays
+    cheaper as a flat list, the way this test intends to check.
+    """
     records = []
-    grid = [[0, 0], [0, 0]]
+    grid = [[0] * size for _ in range(size)]
     for i in range(n):
         before = [row[:] for row in grid]
         grid[0][0] = (grid[0][0] + 1) % 16
@@ -46,11 +55,20 @@ all_ok &= check("exactly one 'Starting Grid:' occurrence", block.count("Starting
 all_ok &= check("Grid 1 labeled with correct trace step", f"Grid 1 (trace step {records[0]['step']})" in block)
 all_ok &= check("Grid 2 labeled with correct trace step", f"Grid 2 (trace step {records[1]['step']})" in block)
 all_ok &= check("Grid 3 labeled with correct trace step", f"Grid 3 (trace step {records[2]['step']})" in block)
-all_ok &= check("Grid 1's diff keyed to Starting Grid -> Grid 1", "changed cells (Starting Grid -> Grid 1):" in block)
-all_ok &= check("Grid 2's diff keyed to Grid 1 -> Grid 2", "changed cells (Grid 1 -> Grid 2):" in block)
-all_ok &= check("Grid 3's diff keyed to Grid 2 -> Grid 3", "changed cells (Grid 2 -> Grid 3):" in block)
+all_ok &= check(
+    "Grid 1's diff keyed to Starting Grid -> Grid 1, as a flat-list (cheapest for a 1-cell diff on a 20x20 grid)",
+    "changed cells (Starting Grid -> Grid 1), flat-list format" in block,
+)
+all_ok &= check(
+    "Grid 2's diff keyed to Grid 1 -> Grid 2, as a flat-list",
+    "changed cells (Grid 1 -> Grid 2), flat-list format" in block,
+)
+all_ok &= check(
+    "Grid 3's diff keyed to Grid 2 -> Grid 3, as a flat-list",
+    "changed cells (Grid 2 -> Grid 3), flat-list format" in block,
+)
 all_ok &= check("is_extend sentence absent when is_extend=False", "NOT the start of the game" not in block)
-all_ok &= check("no full grid shown for ordinary (non-overflow) examples", "in full (shown because" not in block)
+all_ok &= check("no full-grid fallback shown for ordinary (non-overflow) examples", " in full (" not in block)
 
 # ---------------------------------------------------------------------------
 # Case 2: same records, is_extend=True -- the extra sentence should appear
@@ -64,30 +82,71 @@ all_ok &= check(
 )
 
 # ---------------------------------------------------------------------------
-# Case 3: overflow fallback -- manufacture a record with > DIFF_MAX_CELLS
-# changed cells and confirm the "Grid i in full" fallback triggers and is
-# correctly labeled (not a separately-named "Resulting Grid").
+# Case 3: full-dump fallback -- DIFF_MAX_CELLS no longer exists; format_diff
+# now dynamically picks whichever of flat-list/masked-grid/full-dump
+# renders shortest for a given diff (see format_diff's docstring), so
+# there's no fixed cell-count threshold to target directly. To force the
+# full-dump branch specifically, the diff needs to be BOTH dense AND
+# non-repeating -- a uniform "every cell becomes the same new value" change
+# actually compresses so well under masked-grid's value-run RLE that it
+# beats a full dump even at 100% density (verified separately), so this
+# uses a checkerboard-style pattern where no two adjacent cells share a
+# value, defeating both flat-list and masked-grid's RLE.
 # ---------------------------------------------------------------------------
-print("\n=== Case 3: overflow fallback ===")
-# One row of DIFF_MAX_CELLS + 1 cells, every one of them changed -- exactly
-# one more than the threshold, tied to the real constant rather than a
-# hardcoded guess that could silently stop testing the actual boundary if
-# DIFF_MAX_CELLS ever changes.
-n_cells = DIFF_MAX_CELLS + 1
-big_before = [[0] * n_cells]
-big_after = [[1] * n_cells]
+print("\n=== Case 3: full-dump fallback (dense, non-repeating diff) ===")
+size = 20
+dense_before = [[0] * size for _ in range(size)]
+dense_after = [[(r * size + c) % 16 for c in range(size)] for r in range(size)]
 overflow_records = [
-    {"step": 5, "action": "ACTION_A", "grid_before": big_before, "grid_after": big_after},
+    {"step": 5, "action": "ACTION_A", "grid_before": dense_before, "grid_after": dense_after},
 ]
 overflow_block = build_examples_block(overflow_records, encoding="hex", is_extend=False)
 print(overflow_block)
 all_ok &= check(
-    "overflow fallback triggers for a high-change-count example",
-    "Grid 1 in full (shown because too many cells changed to list individually):" in overflow_block,
+    "full-dump fallback triggers for a dense, non-repeating diff",
+    "Grid 1 in full (" in overflow_block and "cells changed" in overflow_block,
 )
 all_ok &= check(
-    "overflow fallback uses the same 'Grid i' label, not a separate 'Resulting Grid' name",
+    "full-dump fallback explicitly states it's NOT the flat-list/masked-grid notation",
+    "NOT real integers or the masked-grid notation used elsewhere" in overflow_block,
+)
+all_ok &= check(
+    "full-dump fallback uses the same 'Grid i' label, not a separate 'Resulting Grid' name",
     "Resulting Grid" not in overflow_block,
+)
+all_ok &= check(
+    "full-dump fallback does NOT also claim a flat-list/masked-grid format name for the same block",
+    "flat-list format" not in overflow_block and "masked-grid format" not in overflow_block,
+)
+
+# ---------------------------------------------------------------------------
+# Case 3b: masked-grid path -- a diff dense enough that a flat per-cell list
+# would be expensive, but sparse/clustered enough that masking + RLE beats
+# both the flat list and a full dump. No prior test exercised this branch
+# at all (it didn't exist before format_diff's dynamic selection).
+# ---------------------------------------------------------------------------
+print("\n=== Case 3b: masked-grid fallback (sparse cluster on a large grid) ===")
+sparse_before = [[4] * size for _ in range(size)]
+sparse_after = [row[:] for row in sparse_before]
+for r in range(5, 10):
+    for c in range(5, 8):
+        sparse_after[r][c] = 9  # a small clustered block of changes
+sparse_records = [
+    {"step": 6, "action": "ACTION_B", "grid_before": sparse_before, "grid_after": sparse_after},
+]
+sparse_block = build_examples_block(sparse_records, encoding="hex", is_extend=False)
+print(sparse_block)
+all_ok &= check(
+    "a clustered mid-size diff on a large grid picks masked-grid format",
+    "changed cells (Starting Grid -> Grid 1), masked-grid format" in sparse_block,
+)
+all_ok &= check(
+    "masked-grid output contains the expected RLE run tokens",
+    "*5" in sparse_block and "4>9" in sparse_block,
+)
+all_ok &= check(
+    "masked-grid case does NOT trigger the full-dump fallback",
+    "in full (" not in sparse_block,
 )
 
 # ---------------------------------------------------------------------------

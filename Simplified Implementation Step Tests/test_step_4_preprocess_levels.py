@@ -41,7 +41,7 @@ args = Namespace(
     trace=str(raw_path), out=str(out_path),
     pre_key="pre_observation", post_key="post_observation",
     frame_key="frame", action_key="action",
-    score_key=None, levels_key="levels_completed",
+    score_key=None, levels_key="levels_completed", actions_key=None,
 )
 cmd_preprocess(args)
 
@@ -99,7 +99,7 @@ args2 = Namespace(
     trace=str(raw_path2), out=str(out_path2),
     pre_key="pre_observation", post_key="post_observation",
     frame_key="frame", action_key="action",
-    score_key=None, levels_key="levels_completed",
+    score_key=None, levels_key="levels_completed", actions_key=None,
 )
 cmd_preprocess(args2)  # should not raise
 
@@ -126,7 +126,7 @@ args3 = Namespace(
     trace=str(raw_path), out=str(out_path3),
     pre_key="pre_observation", post_key="post_observation",
     frame_key="frame", action_key="action",
-    score_key=None, levels_key="",
+    score_key=None, levels_key="", actions_key=None,
 )
 cmd_preprocess(args3)
 with open(out_path3) as f:
