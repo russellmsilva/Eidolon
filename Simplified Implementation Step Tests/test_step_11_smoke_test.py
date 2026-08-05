@@ -251,7 +251,7 @@ chunk2_final_code = make_class_code(range(7), goal_row=7)  # chunk2's actual fin
 # Baseline-only call (max_rounds=0) captures the state right after the
 # baseline recompute, BEFORE any round runs.
 tt.run_chunk_rounds(
-    lambda rn, cbc: (_ for _ in ()).throw(AssertionError("unreachable")),
+    lambda rn, cbc, cbp, cbt: (_ for _ in ()).throw(AssertionError("unreachable")),
     records_b, boundary=13, counts_path=counts_iso, best_counts_path=best_counts_iso,
     baseline_code=chunk2_final_code, max_rounds=0, use_sandbox=False,
 )
@@ -261,7 +261,7 @@ post_baseline_counts = json.loads(Path(counts_iso).read_text())
 counts_iso2 = os.path.join(tmpdir, "counts_iso2.json")
 best_counts_iso2 = os.path.join(tmpdir, "counts_iso2_best.json")
 result_iso = tt.run_chunk_rounds(
-    lambda rn, cbc: make_class_code(range(4), goal_row=7), records_b, boundary=13,
+    lambda rn, cbc, cbp, cbt: make_class_code(range(4), goal_row=7), records_b, boundary=13,
     counts_path=counts_iso2, best_counts_path=best_counts_iso2,
     baseline_code=chunk2_final_code, max_rounds=1, use_sandbox=False,
 )
@@ -277,7 +277,7 @@ print("Part B.5 (commit/revert verified IMMEDIATELY after a forced rejection, no
 # ...then force an accepted round afterward and confirm best_counts updates
 # to match the new counts.
 result_iso2 = tt.run_chunk_rounds(
-    lambda rn, cbc: make_class_code(range(13), goal_row=7), records_b, boundary=13,
+    lambda rn, cbc, cbp, cbt: make_class_code(range(13), goal_row=7), records_b, boundary=13,
     counts_path=counts_iso2, best_counts_path=best_counts_iso2,
     baseline_code=None, max_rounds=1, use_sandbox=False,
 )

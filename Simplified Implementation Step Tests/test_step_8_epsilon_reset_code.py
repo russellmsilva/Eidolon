@@ -73,7 +73,7 @@ reset_counts()
 records = make_trace(20)
 low_acc_candidate = make_candidate(range(2))  # 2/20 = 10%, deliberately bad
 
-def round_builder_1(round_n, current_best_code):
+def round_builder_1(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     assert current_best_code is None, "chunk 1 round 1 should see current_best_code=None"
     return low_acc_candidate
 
@@ -100,7 +100,7 @@ round2_code = make_candidate(list(range(30)) + list(range(30, 69))[:9])  # need 
 round2_code = make_candidate(range(39))            # 39/50 = 78%
 
 calls = []
-def round_builder_2(round_n, current_best_code):
+def round_builder_2(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     calls.append(round_n)
     return {1: round1_code, 2: round2_code}[round_n]
 
@@ -136,7 +136,7 @@ print("Test 2 (baseline 80%, round1 60% rejected, round2 78% accepted): PASS")
 reset_counts()
 round3_code = make_candidate(range(38))  # 38/50 = 76%
 calls3 = []
-def round_builder_3(round_n, current_best_code):
+def round_builder_3(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     calls3.append(round_n)
     return {1: round1_code, 2: round2_code, 3: round3_code}[round_n]
 
@@ -158,7 +158,7 @@ print("Test 2c (max_rounds=3, round3 76% accepted against round2's 78%): PASS")
 # ============================================================
 reset_counts()
 calls1 = []
-def round_builder_1r(round_n, current_best_code):
+def round_builder_1r(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     calls1.append(round_n)
     return round1_code
 
@@ -187,7 +187,7 @@ best_counts_path_a = os.path.join(workdir, "counts_a_best.json")
 counts_path_b = os.path.join(workdir, "counts_b.json")
 best_counts_path_b = os.path.join(workdir, "counts_b_best.json")
 
-result_a = tt.run_chunk_rounds(lambda rn, cbc: (_ for _ in ()).throw(AssertionError("should not be called")),
+result_a = tt.run_chunk_rounds(lambda rn, cbc, cbp, cbt: (_ for _ in ()).throw(AssertionError("should not be called")),
                                 records50, boundary=50, counts_path=counts_path_a,
                                 best_counts_path=best_counts_path_a, baseline_code=baseline_code,
                                 max_rounds=0, **RUN_KWARGS)
@@ -196,7 +196,7 @@ assert counts_after_baseline == read_counts(best_counts_path_a)
 assert result_a["current_best_code"] == baseline_code
 assert result_a["rounds_run"] == 0
 
-result_b = tt.run_chunk_rounds(lambda rn, cbc: round1_code, records50, boundary=50,
+result_b = tt.run_chunk_rounds(lambda rn, cbc, cbp, cbt: round1_code, records50, boundary=50,
                                 counts_path=counts_path_b, best_counts_path=best_counts_path_b,
                                 baseline_code=baseline_code, max_rounds=1, **RUN_KWARGS)
 assert result_b["log"][-1]["event"] == "reject_substitution"
@@ -215,7 +215,7 @@ reset_counts()
 records10 = make_trace(10)
 perfect_code = make_candidate(range(10))  # 10/10 = 100%, zero failures
 calls_es = []
-def round_builder_es(round_n, current_best_code):
+def round_builder_es(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     calls_es.append(round_n)
     return perfect_code
 
@@ -234,7 +234,7 @@ print("Test 4 (zero-failure early stop after round 1, rounds 2-3 never built): P
 reset_counts()
 imperfect_code = make_candidate(range(7))  # 7/10 = 70%, not clean
 calls_es2 = []
-def round_builder_es2(round_n, current_best_code):
+def round_builder_es2(round_n, current_best_code, current_best_n_pass, current_best_n_total):
     calls_es2.append(round_n)
     return {1: imperfect_code, 2: perfect_code}[round_n]
 
@@ -258,7 +258,7 @@ records100 = make_trace(100)
 baseline_3pct = make_candidate(range(3))   # 3/100 = 3%
 zero_pct_code = make_candidate([])         # 0/100 = 0%
 
-result5 = tt.run_chunk_rounds(lambda rn, cbc: zero_pct_code, records100, boundary=100,
+result5 = tt.run_chunk_rounds(lambda rn, cbc, cbp, cbt: zero_pct_code, records100, boundary=100,
                                counts_path=counts_path, best_counts_path=best_counts_path,
                                baseline_code=baseline_3pct, max_rounds=1, **RUN_KWARGS)
 assert abs(result5["log"][0]["accuracy"] - 0.03) < 1e-9  # baseline recompute
