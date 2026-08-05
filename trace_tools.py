@@ -1115,7 +1115,7 @@ def next_level_completion_row(records, prev_boundary):
     post_observation), per cmd_preprocess's extraction and the same
     `goal_reached = post_observation.levels_completed >
     pre_observation.levels_completed` rule used for is_goal certification.
-    A level completes DURING a given row iff that row's own
+    A level completes DURING a given row if that row's own
     levels_completed_after > levels_completed_before — this is a property
     of a single record, never a comparison against a neighboring record.
 
@@ -1364,17 +1364,20 @@ def run_backtest(candidate_path, records, boundary, counts_path, **run_kwargs):
             # First time this row has ever been part of a backtest replay
             # (every replay covers 0..boundary, so this only happens once
             # per row across the whole run) -- actual_grid/actual_goal/
-            # available_actions_before are ground truth and never change,
-            # so they're set here and never touched again below.
-            # available_actions_before uses .get() rather than direct
-            # indexing since older cleaned traces (preprocessed before
-            # --actions-key existed) won't carry this key at all --
-            # format_row_available_actions handles a None gracefully.
+            # available_actions_before/action are ground truth and never
+            # change, so they're set here and never touched again below.
+            # available_actions_before/action both use .get() rather than
+            # direct indexing since older cleaned traces (preprocessed
+            # before --actions-key existed, or predating this field
+            # entirely) won't carry these keys at all -- format_row_
+            # available_actions and build_revise_row_block's action-taken
+            # line both handle a None gracefully.
             counts[step_key] = {
                 "count": 0,
                 "actual_grid": actual_grid,
                 "actual_goal": actual_goal,
                 "available_actions_before": rec.get("available_actions_before"),
+                "action": rec.get("action"),
                 "predicted_grid": None,
                 "predicted_goal": None,
                 "error": None,
@@ -2334,8 +2337,12 @@ wrong in the identical way.
 Use that directly to see where your rule diverges from the truth; you do not need to \
 manually compare grids cell-by-cell yourself. Each counterexample also states \
 its own available actions — the legal action set can differ row to row (e.g. across a \
-level boundary). These rows are selected because your class has failed on them most \
-persistently across the WHOLE trace so far, not just the newest rows it's seen:
+level boundary) — AND the specific action that was actually taken on that row. Available \
+actions is the full legal set; action-taken is the one that actually fired. Use \
+action-taken to tell whether a mismatch is tied to a specific action, or happens \
+regardless of which action fires. These rows are selected because your class has \
+failed on them most persistently across the WHOLE trace so far, not just the newest \
+rows it's seen:
 
 {counterexamples}
 
@@ -2363,9 +2370,14 @@ attempts, "actually, let me try again" rewrites, or alternate versions of the wh
 class. Every if/elif/else branch and every loop body must contain a real statement \
 (return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
 
-State what you changed in this revision in under 100 words, as a comment/docstring in \
-your class labeled "REVISION:" — overwrite any previous "REVISION:" block already \
-there rather than appending to it, so only your latest revision notes remain. Do not \
+State what you changed in this revision in under 100 words TOTAL, as a comment/docstring \
+in your class labeled exactly "REVISION:" — overwrite any previous "REVISION:" block \
+already there rather than appending to it, so only your latest revision notes remain. \
+Do not invent additional labeled sections to hold overflow notes (e.g. "NEW \
+ADJUSTMENT:", "FINAL FIX:", "UPDATE:", or anything similar) — if your changes don't fit \
+in 100 words under REVISION, summarize more tersely instead of adding another section. \
+Your class's docstring must contain at most two labeled blocks in total: "DESCRIPTION:" \
+and "REVISION:" — nothing else. Do not \
 re-examine the same counterexamples repeatedly or restate your reasoning multiple \
 times — write your best fix and move on, even if it's imperfect. You'll get another \
 revision round later if something is still wrong.
@@ -2499,8 +2511,17 @@ def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_bo
     action_vocabulary is deliberately derived from new_records alone (this
     chunk only), not the whole trace — see format_chunk_action_vocabulary's
     docstring for why that's the intended scope, not a limitation.
+
+    If candidate_code still descends from FALLBACK_CANDIDATE_CODE (see
+    _descends_from_fallback), NOOP_LINEAGE_WARNING is prepended and the
+    stale marker sentence is stripped out of the embedded docstring before
+    formatting — see both docstrings under the run-chunked section for why.
     """
-    return EXTEND_TEMPLATE.format(
+    prefix = ""
+    if _descends_from_fallback(candidate_code):
+        prefix = NOOP_LINEAGE_WARNING
+        candidate_code = _strip_fallback_marker_sentence(candidate_code)
+    return prefix + EXTEND_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
         encoding_explanation=encoding_explanation(encoding),
         action_vocabulary=format_chunk_action_vocabulary(new_records),
@@ -2656,11 +2677,18 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
     """
     Render one selected row_failure_counts.json entry as a counterexample.
     Built entirely from the entry's own fields — count, actual_grid/
-    actual_goal (ground truth), predicted_grid/predicted_goal/error (most
-    recent attempt), available_actions_before (ground truth, see
-    run_backtest) — no grid_before/action are available in this schema,
-    so the diff shown here is between the predicted grid and the correct
-    grid directly, not a before/after transition diff.
+    actual_goal/action (ground truth), predicted_grid/predicted_goal/error
+    (most recent attempt), available_actions_before (ground truth, see
+    run_backtest) — no grid_before is available in this schema, so the
+    diff shown here is between the predicted grid and the correct grid
+    directly, not a before/after transition diff. action IS available
+    (unlike grid_before) — it's the actual action taken on this row,
+    distinct from available_actions_before's full legal action SET, and is
+    what lets a revision round tell whether a transformation is tied to
+    which specific action fired rather than just "some action fired."
+    entry.get("action") rather than direct indexing, since a
+    row_failure_counts.json written before this field existed won't carry
+    it — shown as "not recorded" in that case, not silently omitted.
 
     Three distinct cases:
       - False-positive goal (predicted_goal=True, actual_goal=False):
@@ -2684,9 +2712,11 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
     predicted_goal = entry.get("predicted_goal")
     error = entry.get("error")
 
+    action_taken = entry.get("action")
     header = (
         f"### Counterexample {i} (trace step {step_key}, failed {count}x so far)\n"
         f"{format_row_available_actions(entry.get('available_actions_before'))}\n"
+        f"action actually taken on this row: {action_taken if action_taken is not None else 'not recorded (row scored before this field existed)'}\n"
     )
 
     if error is not None:
@@ -2759,6 +2789,12 @@ def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"
         improves — select_top_k_failures simply returns however many
         failing rows exist (via a plain list slice, which is a no-op if
         the list is already shorter than k). This must NOT raise.
+
+    If candidate_code still descends from FALLBACK_CANDIDATE_CODE (see
+    _descends_from_fallback), NOOP_LINEAGE_WARNING is prepended and the
+    stale marker sentence is stripped from the embedded docstring before
+    formatting, same as build_extend_prompt — see both docstrings under
+    the run-chunked section for why.
     """
     total_rows = len(row_failure_counts)
     if k > total_rows:
@@ -2791,7 +2827,12 @@ def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"
         if most_recent_step is not None else None
     )
 
-    return REVISE_TEMPLATE.format(
+    prefix = ""
+    if _descends_from_fallback(candidate_code):
+        prefix = NOOP_LINEAGE_WARNING
+        candidate_code = _strip_fallback_marker_sentence(candidate_code)
+
+    return prefix + REVISE_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
         encoding_explanation=encoding_explanation(encoding),
         status_notes=build_revise_status_notes(most_recent_passed),
@@ -3140,10 +3181,113 @@ FALLBACK_CANDIDATE_CODE = '''class GameModel:
         return grid_before, False, previous_state
 '''
 
+# The exact sentence FALLBACK_CANDIDATE_CODE's docstring opens with. Used as
+# a lineage marker -- observed in real runs that a revision round asked to
+# "revise rather than rewrite from scratch" will preserve this sentence
+# verbatim in the docstring even after several further rounds of genuine
+# (if still wrong) logic get layered on top of it, since nothing ever tells
+# it the framing itself ("this is a safe no-op stub") is stale and no
+# longer describes what the class actually does. Checked whitespace-
+# insensitively (see _descends_from_fallback/_strip_fallback_marker_
+# sentence), not as a raw substring or equality against
+# FALLBACK_CANDIDATE_CODE -- the marker line-wraps across multiple
+# indented lines in the source above, so a plain substring check against
+# it would never match even the unmodified stub; a revision round
+# reformatting the docstring's wrapping when it regenerates the class
+# would break an exact match the same way.
+FALLBACK_ORIGIN_MARKER = "Safe no-op stub substituted in when this round's LLM output could not be validated"
+
+# Prepended to the prompt (and the stale marker sentence stripped from the
+# embedded docstring) whenever current_best_code descends from the fallback
+# stub -- see _descends_from_fallback. Deliberately overrides the
+# surrounding template's usual "revise rather than rewrite from scratch"
+# instruction for this one round only: there is no real prior work to
+# preserve here, so treating it as some counts against the model.
+NOOP_LINEAGE_WARNING = (
+    "This class is a NOOP class. Completely replace it with new logic based "
+    "on the examples/counterexamples below, including a fresh DESCRIPTION "
+    "of what your new code actually does -- do not preserve any of its "
+    "existing docstring text, comments, or reasoning. For this round only, "
+    "ignore the instruction elsewhere to revise rather than rewrite from "
+    "scratch.\n\n"
+)
+
+
+# Full sentence FALLBACK_CANDIDATE_CODE's docstring consists of, used by
+# _strip_fallback_marker_sentence -- a superset of FALLBACK_ORIGIN_MARKER
+# (which is only the opening clause, kept shorter since that's all
+# _descends_from_fallback needs to detect lineage).
+_FALLBACK_MARKER_SENTENCE = (
+    "Safe no-op stub substituted in when this round's LLM output could not "
+    "be validated as safe code (SyntaxError or a disallowed import) -- see "
+    "_validate_candidate_code. Always predicts no change and no goal, so it "
+    "scores low but never crashes the sandboxed backtest."
+)
+
+
+def _whitespace_flexible_pattern(text):
+    """
+    Build a compiled regex that matches `text` with any run of whitespace
+    between words treated as interchangeable with any OTHER run of
+    whitespace (one space, a newline plus indentation, etc.) -- exactly
+    the mismatch that breaks a plain substring check against
+    FALLBACK_CANDIDATE_CODE's docstring, which line-wraps this text across
+    several indented lines rather than keeping it on one line. Escapes
+    each word individually (re.escape) so punctuation in the sentence
+    (parentheses, periods, the em-dash-style "--") is matched literally,
+    not as regex syntax.
+    """
+    import re
+    return re.compile(r"\s+".join(re.escape(word) for word in text.split()))
+
+
+_FALLBACK_ORIGIN_MARKER_PATTERN = _whitespace_flexible_pattern(FALLBACK_ORIGIN_MARKER)
+_FALLBACK_MARKER_SENTENCE_PATTERN = _whitespace_flexible_pattern(_FALLBACK_MARKER_SENTENCE)
+
+
+def _descends_from_fallback(code):
+    """
+    True if `code`'s docstring still carries FALLBACK_ORIGIN_MARKER --
+    either because `code` IS the unmodified FALLBACK_CANDIDATE_CODE, or
+    because a later round revised it in place without ever discarding that
+    framing. Matched via _FALLBACK_ORIGIN_MARKER_PATTERN (whitespace-
+    flexible — see _whitespace_flexible_pattern), not a plain substring or
+    equality check against FALLBACK_CANDIDATE_CODE -- a revised-but-still-
+    tainted descendant has real changes elsewhere in the class and is
+    no longer byte-identical to the original stub, and even the
+    unmodified stub's own marker text line-wraps across the source above
+    in a way a plain substring check would never match.
+
+    Purely a function of whatever code is current-best AT PROMPT-BUILD TIME
+    -- no separate flag is tracked in row_failure_counts.json or run_state.
+    This makes the warning self-correcting by construction: it fires the
+    round after a validation failure substitutes the stub back in, and
+    stops firing the moment a genuinely fresh (marker-free) class gets
+    accepted, with no cleanup step needed either way.
+    """
+    return _FALLBACK_ORIGIN_MARKER_PATTERN.search(code) is not None
+
+
+def _strip_fallback_marker_sentence(code):
+    """
+    Remove _FALLBACK_MARKER_SENTENCE from `code`'s docstring before
+    embedding it in a prompt, so a class already flagged by
+    _descends_from_fallback doesn't also visually restate "I am a no-op
+    stub" to the model one paragraph below NOOP_LINEAGE_WARNING telling it
+    to ignore exactly that framing. Matched whitespace-flexibly (same
+    reasoning as _descends_from_fallback) so this actually removes the
+    sentence regardless of how it's line-wrapped/indented. Best-effort
+    textual removal (not an AST edit) -- this only ever runs on code
+    already known to contain the marker, and leaves the rest of the
+    docstring/class untouched, including any real logic worth the model
+    seeing before it rewrites from scratch.
+    """
+    return _FALLBACK_MARKER_SENTENCE_PATTERN.sub("", code)
+
 
 def _defines_class_method(tree, class_name, method_name):
     """
-    True iff `tree` (an already-parsed ast.Module) contains a class named
+    True if `tree` (an already-parsed ast.Module) contains a class named
     class_name with a method named method_name anywhere in its body,
     scanning the WHOLE tree (ast.walk) rather than just the top level --
     consistent with check_ast_imports' own whole-tree scanning style. Not a
@@ -3293,6 +3437,22 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
             if n_defs > 0:
                 print(f"{round_label}: candidate's GameModel class/methods redefined {n_defs} extra "
                       f"time(s) (re-attempts); keeping only the first, discarding the rest")
+            # Persisted UNCONDITIONALLY, before _validate_candidate_code can
+            # substitute FALLBACK_CANDIDATE_CODE in and this round's real
+            # output would otherwise never touch disk at all -- see
+            # _validate_candidate_code's docstring for why a validation
+            # failure discards `code` entirely rather than keeping it
+            # anywhere. Written every round regardless of pass/fail, not
+            # just on failure, so a successful round's raw response is also
+            # available later (e.g. to check whether keep_first_class_def
+            # trimmed something it shouldn't have).
+            raw_debug_path = workdir / f"chunk{chunk_number}_raw_round{round_n}.txt"
+            atomic_write_text(
+                raw_debug_path,
+                f"=== RAW LLM RESPONSE (before extract_code) ===\n{response}\n\n"
+                f"=== EXTRACTED CODE (after extract_code + keep_first_class_def, "
+                f"before _validate_candidate_code) ===\n{code}\n"
+            )
             code = _validate_candidate_code(code, round_label)
             candidate_path = workdir / f"chunk{chunk_number}_candidate_round{round_n}.py"
             atomic_write_text(candidate_path, code)
