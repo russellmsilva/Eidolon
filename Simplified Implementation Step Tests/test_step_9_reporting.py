@@ -58,7 +58,7 @@ records = make_trace(150)
 
 chunk1_code = make_candidate(range(45))  # 45/50 = 90%
 chunk1_result = tt.run_chunk_rounds(
-    lambda rn, cbc: chunk1_code, records, boundary=50,
+    lambda rn, cbc, cbp, cbt: chunk1_code, records, boundary=50,
     counts_path=counts_path, best_counts_path=best_counts_path,
     baseline_code=None, max_rounds=1, **RUN_KWARGS,
 )
@@ -67,7 +67,7 @@ chunk2_baseline = make_candidate(range(80))  # 80/100 = 80% at boundary=100
 chunk2_round1 = make_candidate(range(40))    # 40/100 = 40% -- rejected (threshold 75%)
 chunk2_round2 = make_candidate(range(60))    # 60/100 = 60% -- also rejected (still compared to 80% baseline, not round1)
 chunk2_result = tt.run_chunk_rounds(
-    lambda rn, cbc: {1: chunk2_round1, 2: chunk2_round2}[rn], records, boundary=100,
+    lambda rn, cbc, cbp, cbt: {1: chunk2_round1, 2: chunk2_round2}[rn], records, boundary=100,
     counts_path=counts_path, best_counts_path=best_counts_path,
     baseline_code=chunk2_baseline, max_rounds=2, **RUN_KWARGS,
 )
@@ -75,7 +75,7 @@ chunk2_result = tt.run_chunk_rounds(
 chunk3_baseline = chunk2_result["current_best_code"]  # whatever chunk 2 actually ended with (the 80% baseline)
 chunk3_perfect = make_candidate(range(150))  # boundary=150 -> call-indices 0..149, all correct = zero failures
 chunk3_calls = []
-def chunk3_builder(rn, cbc):
+def chunk3_builder(rn, cbc, cbp, cbt):
     chunk3_calls.append(rn)
     return chunk3_perfect
 

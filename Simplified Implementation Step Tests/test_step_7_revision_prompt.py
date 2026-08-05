@@ -77,15 +77,15 @@ assert "predict_next_state" not in prompt  # old single-function contract must b
 # row 13: error, highest count -> Counterexample 1
 assert "raised an error or timed out" in prompt
 assert "ZeroDivisionError: boom" in prompt
-assert "Counterexample 1 (trace step 13, failed 4x so far)" in prompt
+assert "Counterexample 1 (trace step 13)" in prompt
 # row 10: ordinary wrong-transition
-assert "Counterexample 2 (trace step 10, failed 3x so far)" in prompt
+assert "Counterexample 2 (trace step 10)" in prompt
 # row 11: false positive
 assert "FALSE-POSITIVE goal prediction" in prompt
-assert "Counterexample 3 (trace step 11, failed 2x so far)" in prompt
+assert "Counterexample 3 (trace step 11)" in prompt
 # row 12: false negative -- grid diff omitted
 assert "MISSED LEVEL-COMPLETION TRANSITION" in prompt
-assert "Counterexample 4 (trace step 12, failed 1x so far)" in prompt
+assert "Counterexample 4 (trace step 12)" in prompt
 # passing row must not appear as a counterexample header
 assert "trace step 9," not in prompt
 

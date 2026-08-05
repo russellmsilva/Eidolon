@@ -132,14 +132,25 @@ def extract_current_grid(frames):
 
 def grid_to_compact(grid):
     """
-    Render a grid as one row per line, one character per cell.
-    ARC-AGI-3 grids use color indices beyond single digits (values up to at
-    least 14 seen in real traces) — plain str(c) concatenation is ambiguous
-    for any cell >= 10 (e.g. row [3, 11, 3] -> "3113", indistinguishable from
+    Render a grid as one row per line, one character per cell, each line
+    prefixed with its row number (e.g. "R 7| 3b0..."). ARC-AGI-3 grids use
+    color indices beyond single digits (values up to at least 14 seen in
+    real traces) — plain str(c) concatenation is ambiguous for any cell
+    >= 10 (e.g. row [3, 11, 3] -> "3113", indistinguishable from
     [3, 1, 1, 3]). Cells are mapped to single hex characters (0-9, a-f)
     instead, keeping the one-char-per-cell density but staying unambiguous
     for values up to 15. Raises loudly rather than silently mis-encoding if
     a value outside that range ever shows up.
+
+    The "R{n}| " prefix exists so a model describing object positions (in
+    a DESCRIPTION, or when reasoning about where a change happened) can
+    read a row number directly rather than counting lines to find it --
+    the same rationale as format_run_list_diff's explicit row/col labels,
+    applied here to full grid dumps instead of diffs. Right-justified to a
+    width derived from the grid's own row count (not hardcoded to any
+    particular game's dimensions), so "R 7|" and "R63|" line up under each
+    other for any grid size. See ENCODING_EXPLANATION_HEX -- the model is
+    told explicitly that this prefix is a display aid, not grid data.
     """
     HEX_DIGITS = "0123456789abcdef"
 
@@ -152,18 +163,24 @@ def grid_to_compact(grid):
             )
         return HEX_DIGITS[c]
 
-    return "\n".join("".join(cell_char(c) for c in row) for row in grid)
+    row_num_width = len(str(max(len(grid) - 1, 0)))
+    return "\n".join(
+        f"R{r:>{row_num_width}}| " + "".join(cell_char(c) for c in row)
+        for r, row in enumerate(grid)
+    )
 
 
 def grid_to_rle(grid):
     """
     Render a grid as one row per line, run-length encoded: each row becomes
     space-separated "<hexchar>*<count>" runs (e.g. row [0,0,0,0,0,0,0,3,3] ->
-    "0*7 3*2"). Same 0-15 hex-digit cell mapping as grid_to_compact. This is
-    strictly a prompt-side display shorthand to cut tokens for large/sparse
-    grids with long runs of a repeated value (e.g. background) — the model
-    never has to decode it, since predict_next_state always takes/returns
-    plain Python int grids regardless of how they were shown in the prompt.
+    "0*7 3*2"). Same 0-15 hex-digit cell mapping as grid_to_compact, and the
+    same "R{n}| " row-number prefix -- see grid_to_compact's docstring for
+    why. This is strictly a prompt-side display shorthand to cut tokens for
+    large/sparse grids with long runs of a repeated value (e.g. background)
+    — the model never has to decode it, since predict_next_state always
+    takes/returns plain Python int grids regardless of how they were shown
+    in the prompt.
     """
     HEX_DIGITS = "0123456789abcdef"
 
@@ -176,8 +193,9 @@ def grid_to_rle(grid):
             )
         return HEX_DIGITS[c]
 
+    row_num_width = len(str(max(len(grid) - 1, 0)))
     lines = []
-    for row in grid:
+    for r, row in enumerate(grid):
         runs = []
         i = 0
         while i < len(row):
@@ -186,7 +204,7 @@ def grid_to_rle(grid):
                 j += 1
             runs.append(f"{cell_char(row[i])}*{j - i}")
             i = j
-        lines.append(" ".join(runs))
+        lines.append(f"R{r:>{row_num_width}}| " + " ".join(runs))
     return "\n".join(lines)
 
 
@@ -195,9 +213,6 @@ def encode_grid(grid, encoding="hex"):
     if encoding == "rle":
         return grid_to_rle(grid)
     return grid_to_compact(grid)
-
-
-HEX_DIGITS = "0123456789abcdef"
 
 
 def diff_grid(grid_before, grid_after):
@@ -222,123 +237,115 @@ def diff_grid(grid_before, grid_after):
     return changes
 
 
-def format_flat_diff(changes):
+def format_run_list_diff(changes):
     """
-    Render a diff_grid() result as a 'row,col: before -> after' list, one
-    changed cell per line, real integer values throughout (never the
-    hex/RLE display shorthand — see ENCODING_EXPLANATION_HEX/RLE, which
-    only ever describes how full GRIDS are shown, not this list).
+    Render a diff_grid() result as one line per (row-range, col-range)
+    group: "(row R | rows R1-R2, col C | cols C1-C2): before -> after",
+    real integer values 0-15 throughout (not hex — matches the old
+    flat-list format's convention, since this format already asks the
+    model to read literal numbers rather than decode anything).
+
+    Replaces the old two-format flat-list/masked-grid split with a single
+    format that's never worse than either: it degrades to one line per
+    changed cell (matching the old flat-list) when there's no row-
+    repetition or column-adjacency to exploit, and compresses far more
+    aggressively than the old masked-grid format did whenever a change
+    block DOES repeat across rows or columns -- crucially, unlike masked-
+    grid, it NEVER pays for unaffected rows (masked-grid always emitted
+    one line per grid row, "*N" filler and all, even when zero cells in
+    that row changed).
+
+    The core motivation is spatial-numeracy, not compression: the old
+    masked-grid format required the reader to (a) count down lines to
+    know which row a line described, and (b) sum "*N" skip-tokens
+    sequentially to recover a run's absolute starting column -- exactly
+    the kind of mechanical counting/arithmetic an LLM (especially a
+    quantized local one) is unreliable at, and exactly the failure
+    signature observed in real revision rounds (a fix that had the right
+    idea but the wrong column offset, or covered only one column of a
+    much wider correct range). This format states row/column numbers as
+    literal integers the model reads directly -- no counting required,
+    regardless of how compact or verbose the overall diff ends up being.
+
+    Two-pass grouping, both operating directly on `changes` (already
+    row/col/before/after tuples -- no grid shape needed):
+      1. Within each row, collapse maximal runs of consecutive columns
+         sharing the same (before, after) pair into one (col_start,
+         col_end, before, after) tuple.
+      2. Merge consecutive rows whose ENTIRE run-list (all columns AND
+         values) is identical into one row-range line. Exact-match only,
+         deliberately -- no fuzzy/approximate grouping that could
+         overstate which rows actually share behavior (e.g. a curved
+         object's row-to-row column range rarely matches exactly, and
+         this format correctly falls back to one line per row for that
+         case rather than forcing a misleading merge).
+
+    Degrades gracefully rather than blowing up on unstructured diffs (a
+    checkerboard flip, random scattered noise): worst case is exactly
+    format_flat_diff's old output, one line per changed cell, still no
+    counting required per line even though there's no compression to
+    gain -- confirmed against synthetic worst-case traces (checkerboard/
+    scattered-random/threshold-straddling all correctly lose the
+    subsequent full-grid-dump comparison in build_examples_block/
+    build_revise_row_block by a wide margin, exactly as the old masked-
+    grid format did for the same adversarial cases).
     """
-    return "\n".join(f"(row {r}, col {c}): {b} -> {a}" for r, c, b, a in changes)
+    if not changes:
+        return "no cells changed (identity transformation for this example)"
 
+    by_row = {}
+    for r, c, b, a in changes:
+        by_row.setdefault(r, []).append((c, b, a))
 
-def format_masked_diff(changes, shape_grid):
-    """
-    Render a diff_grid() result as a "masked grid": one line per row of
-    `shape_grid` (used only for its dimensions), with runs of identical
-    consecutive cells RLE-compressed — both unchanged runs ("*N": N
-    consecutive cells that didn't change) and changed-value runs
-    ("before>after*N": N consecutive cells that all changed from the same
-    before value to the same after value). A single, non-repeated changed
-    cell is just "before>after" with no "*1" suffix — the suffix only
-    appears once a run has 2+ cells, since a bare "before>after" is
-    already unambiguous on its own. All values use hex digits (the same
-    0-15 alphabet ENCODING_EXPLANATION_HEX already describes for grids),
-    never real integers — this is fundamentally a grid-shaped format, and
-    mixing real integers into a grid-shaped context would be more
-    confusing than staying consistent with how every other grid in the
-    prompt is shown.
-
-    Exists alongside format_flat_diff as the second of two candidates
-    format_diff picks between — see format_diff's docstring for why picking
-    dynamically beats a fixed cell-count threshold. This representation
-    wins specifically when a diff is sparse (few changed cells scattered
-    across a mostly-unchanged grid): the RLE runs collapse long unchanged
-    OR uniformly-changed stretches to a few characters each, which a flat
-    per-cell list cannot do, while still preserving the 2D spatial layout
-    of what changed (a flat list of (row, col) pairs doesn't show a moving
-    object's shape the way a masked grid naturally does).
-
-    Deliberately does NOT also RLE-compress runs of identical ROW STRINGS
-    (e.g. many consecutive "*64" rows collapsing to one "*64 x40" line) —
-    that's a real further reduction (measured independently), but adds a
-    second, distinct compression axis for the model to track correctly on
-    top of this one, and its benefit is shape-dependent in a way this
-    per-row compression isn't (a curved/irregular moving object's own rows
-    rarely repeat exactly, even though the background surrounding it
-    usually does). Holding off on that specific addition until there's a
-    concrete signal that prompt format complexity — as opposed to model
-    capability — is actually the bottleneck worth spending it on.
-    """
-    changed = {(r, c): (b, a) for r, c, b, a in changes}
-    lines = []
-    for r, row in enumerate(shape_grid):
-        # First pass: one raw token per cell (None for unchanged, else the
-        # "before>after" hex pair) — kept separate from the RLE pass below
-        # so the same run-collapsing logic applies uniformly to both kinds
-        # of run instead of needing two different code paths.
-        raw_tokens = []
-        for c in range(len(row)):
-            if (r, c) in changed:
-                b, a = changed[(r, c)]
-                raw_tokens.append(f"{HEX_DIGITS[b]}>{HEX_DIGITS[a]}")
-            else:
-                raw_tokens.append(None)
-
-        tokens = []
+    row_runs = {}
+    for r, cells in by_row.items():
+        cells.sort()
+        runs = []
         i = 0
-        while i < len(raw_tokens):
+        while i < len(cells):
             j = i
-            while j < len(raw_tokens) and raw_tokens[j] == raw_tokens[i]:
+            while (j + 1 < len(cells)
+                   and cells[j + 1][0] == cells[j][0] + 1
+                   and cells[j + 1][1] == cells[i][1]
+                   and cells[j + 1][2] == cells[i][2]):
                 j += 1
-            run_len = j - i
-            if raw_tokens[i] is None:
-                tokens.append(f"*{run_len}")
-            elif run_len > 1:
-                tokens.append(f"{raw_tokens[i]}*{run_len}")
-            else:
-                tokens.append(raw_tokens[i])
-            i = j
-        lines.append(" ".join(tokens))
+            col_start, before, after = cells[i]
+            col_end = cells[j][0]
+            runs.append((col_start, col_end, before, after))
+            i = j + 1
+        row_runs[r] = runs
+
+    rows_sorted = sorted(row_runs.keys())
+    lines = []
+    i = 0
+    while i < len(rows_sorted):
+        r0 = rows_sorted[i]
+        j = i
+        while (j + 1 < len(rows_sorted)
+               and rows_sorted[j + 1] == rows_sorted[j] + 1
+               and row_runs[rows_sorted[j + 1]] == row_runs[r0]):
+            j += 1
+        r1 = rows_sorted[j]
+        row_label = f"row {r0}" if r0 == r1 else f"rows {r0}-{r1}"
+        for col_start, col_end, before, after in row_runs[r0]:
+            col_label = f"col {col_start}" if col_start == col_end else f"cols {col_start}-{col_end}"
+            lines.append(f"({row_label}, {col_label}): {before} -> {after}")
+        i = j + 1
     return "\n".join(lines)
 
 
-def format_diff(changes, shape_grid):
+def format_diff(changes):
     """
-    Render a diff_grid() result using whichever of two candidate formats is
-    actually shorter for THIS specific diff: format_flat_diff (a real-int
-    per-cell list) or format_masked_diff (a masked grid with RLE-compressed
-    unchanged runs). Returns (format_name, text) — callers embed
-    format_name inline next to the diff so each block is self-describing
-    regardless of which format won, rather than relying on the model to
-    remember a single "sometimes it looks like X, sometimes like Y"
-    explanation from earlier in a long prompt.
-
-    Deliberately NOT a fixed cell-count threshold (the previous design,
-    DIFF_MAX_CELLS): measured against a real 400-row ls20 trace, the
-    crossover point between these two formats turned out to depend on
-    things a fixed number can't capture — grid dimensions (format_masked_diff's
-    per-row "*N" overhead scales with grid height), and how clustered vs.
-    scattered the changes are (RLE compresses clustered changes far better
-    than scattered ones). Comparing actual rendered length per diff is
-    cheap (plain string-length comparisons, not model calls) and is
-    correct by construction for any game's grid size and change pattern,
-    with no per-game tuning required.
-
-    shape_grid must be a grid the same shape as the one the diff was
-    computed against (grid_after for a normal before/after transition
-    diff; the correct/actual grid for a build_revise_row_block prediction-
-    vs-correct diff) — only its dimensions are used, not its values (every
-    changed cell's actual before/after values already come from `changes`
-    itself).
+    Thin wrapper around format_run_list_diff kept for call-site stability:
+    returns (format_name, text), matching the old (format_name, text)
+    contract callers already rely on for inline "which format did this
+    block use" labeling in the prompt -- except now format_name is always
+    the same constant, "run-list", since there's only one format left.
+    Kept as a separate function (rather than inlining format_run_list_diff
+    at every call site) purely so callers don't need to know or care that
+    the format-name concept became vestigial.
     """
-    if not changes:
-        return "flat", "no cells changed (identity transformation for this example)"
-    flat = format_flat_diff(changes)
-    masked = format_masked_diff(changes, shape_grid)
-    if len(masked) < len(flat):
-        return "masked-grid", masked
-    return "flat-list", flat
+    return "run-list", format_run_list_diff(changes)
 
 
 
@@ -1469,7 +1476,8 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
     (`best_counts_path`) in lockstep with whichever candidate is genuinely
     current-best.
 
-    round_builder(round_n, current_best_code) -> candidate_code is supplied
+    round_builder(round_n, current_best_code, current_best_n_pass, current_best_n_total)
+    -> candidate_code is supplied
     by the caller (the outer per-chunk loop, cmd_run_chunked), not built in
     here, so this stays testable without a real LLM call. round_n starts at
     1: round 1 should build EXTEND_TEMPLATE (chunk 1: PROMPT_TEMPLATE) from
@@ -1543,6 +1551,8 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
     current_best_accuracy = None
     current_best_scored = None  # feeds summarize_scores/print_score_summary directly, once a chunk finishes
     current_best_streak = None  # reported per chunk, never fed into a prompt
+    current_best_n_pass = None  # fed into round_builder -> build_overall_accuracy_note (see there)
+    current_best_n_total = None
 
     def backtest_code(code):
         path = _write_temp_candidate_file(code)
@@ -1557,6 +1567,8 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
         current_best_accuracy = result["accuracy"]
         current_best_scored = result["scored"]
         current_best_streak = result["streak"]
+        current_best_n_pass = result["n_pass"]
+        current_best_n_total = result["n_total"]
         atomic_copy_json(counts_path, best_counts_path)  # baseline recompute is always an automatic "accept"
         log.append({
             "event": "baseline_recompute",
@@ -1569,7 +1581,7 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
     round_n = 0
     early_stopped = False
     for round_n in range(1, max_rounds + 1):
-        candidate_code = round_builder(round_n, current_best_code)
+        candidate_code = round_builder(round_n, current_best_code, current_best_n_pass, current_best_n_total)
         result = backtest_code(candidate_code)
         candidate_accuracy = result["accuracy"]
 
@@ -1586,6 +1598,8 @@ def run_chunk_rounds(round_builder, records, boundary, counts_path, best_counts_
             current_best_code, current_best_accuracy = candidate_code, candidate_accuracy
             current_best_scored = result["scored"]
             current_best_streak = result["streak"]
+            current_best_n_pass = result["n_pass"]
+            current_best_n_total = result["n_total"]
             atomic_copy_json(counts_path, best_counts_path)  # commit this round's mutations
             log.append({
                 "event": "accept", "round": round_n,
@@ -1954,20 +1968,26 @@ def cmd_preprocess(args):
 
 
 ENCODING_EXPLANATION_HEX = """IMPORTANT — display format vs. real data: grids below are shown as one row per line, \
-one character per cell, as a compact display shorthand only. Each character is a \
+one character per cell, as a compact display shorthand only. Each line is prefixed with \
+"R<n>| " stating that line's row number (e.g. "R 7|") — this prefix is a display aid \
+only, not grid data; do not count it as a cell. Each character after the prefix is a \
 single hexadecimal digit standing in for one integer color value 0-15 (0-9 mean \
-themselves; a=10, b=11, c=12, d=13, e=14, f=15). For example the row "3b0" represents \
-the actual list [3, 11, 0]. The function you write never sees or returns these \
-characters — it always works with real Python integers."""
+themselves; a=10, b=11, c=12, d=13, e=14, f=15). For example the line "R 2| 3b0" \
+represents row 2 as the actual list [3, 11, 0]. The function you write never sees or \
+returns these characters or the row-number prefix — it always works with real Python \
+integers."""
 
 ENCODING_EXPLANATION_RLE = """IMPORTANT — display format vs. real data: grids below are shown one row per \
-line, run-length encoded as a compact display shorthand only. Each row is a \
+line, run-length encoded as a compact display shorthand only. Each line is prefixed \
+with "R<n>| " stating that line's row number (e.g. "R 7|") — this prefix is a display \
+aid only, not grid data; do not count it as a cell. After the prefix, each row is a \
 space-separated sequence of "<digit>*<count>" runs, where <digit> is a single \
 hexadecimal digit standing in for one integer color value 0-15 (0-9 mean themselves; \
 a=10, b=11, c=12, d=13, e=14, f=15) and <count> is how many times that value repeats \
-consecutively. For example the row "0*7 3*2" represents the actual list \
+consecutively. For example the line "R 2| 0*7 3*2" represents row 2 as the actual list \
 [0, 0, 0, 0, 0, 0, 0, 3, 3]. The function you write never sees or returns this \
-run-length notation — it always works with real Python integers."""
+run-length notation or the row-number prefix — it always works with real Python \
+integers."""
 
 
 def encoding_explanation(encoding):
@@ -2107,10 +2127,13 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
     specific failing rows; the model can update DESCRIPTION opportunistically
     as part of a normal revision without a separately mandated step there).
 
-    PROMPT_TEMPLATE (chunk 1, is_extend=False) gets the 3-step version — there's no
-    prior description to consult yet. EXTEND_TEMPLATE (every chunk after the first,
-    is_extend=True) gets a 4-step version whose new first step asks the model to
-    check its existing DESCRIPTION comment against the new examples before deciding
+    PROMPT_TEMPLATE (chunk 1, is_extend=False) gets the 4-step version — there's no
+    prior description to consult yet, but the new step 4 (state-design reasoning)
+    still applies from the very first attempt: see that step's own inline comment
+    for why documenting this decision early matters even before any code exists
+    to revise later. EXTEND_TEMPLATE (every chunk after the first, is_extend=True)
+    gets a different 4-step version whose new first step asks the model to check
+    its existing DESCRIPTION comment against the new examples before deciding
     whether it still holds.
 
     When this EXTEND_TEMPLATE call is for the chunk that starts right after a level
@@ -2126,7 +2149,7 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
     """
     if not is_extend:
         steps = (
-            "There are three steps to accomplishing this task:\n"
+            "There are four steps to accomplishing this task:\n"
             '1: First, look at the color values in the "Starting Grid". Notice the '
             "shapes. Notice any objects that stand out with color values different "
             "from whatever colors dominate most of the grid (background regions).\n"
@@ -2136,7 +2159,19 @@ def build_description_instruction(is_extend=False, is_level_boundary=False):
             'Examples of object purposes are "player-movable object", "goal '
             'destination for player-movable object", and "object that changes '
             "another object's shape or color\" (these are just examples — there may "
-            "be other kinds of objects/purposes)."
+            "be other kinds of objects/purposes).\n"
+            "4: Fourth, decide what — if anything — cannot be determined from a "
+            "single grid_before/action pair alone, and must be carried forward via "
+            "previous_state instead (e.g. a counter, a position or phase the grid "
+            "doesn't otherwise reveal, something that only makes sense in light of "
+            "prior steps). Track only what you have real evidence requires memory — "
+            "do not add state \"just in case\". State this reasoning explicitly: what "
+            "you chose to track, and why the grid alone isn't enough for it. This "
+            "matters beyond just this class working now — if a later revision finds "
+            "your predictions failing in a way your current state can't explain, "
+            "that is a signal the state itself needs to change, not just the rule "
+            "acting on it, and your reasoning here is what a later round will need "
+            "to reconsider."
         )
         return f"{DESCRIPTION_INSTRUCTION_COMMON_INTRO} {steps}\n{DESCRIPTION_INSTRUCTION_TRAILER}"
 
@@ -2213,20 +2248,18 @@ chance to fix mistakes in later rounds, so an imperfect-but-complete class now i
 more useful than a perfect rule you never finish writing.
 
 Following the "Starting Grid", each example's changed cells are shown in whichever \
-of three formats is most compact for that specific example — every example names \
-its own format inline, so read that name and apply the matching rule below rather \
-than assuming all examples use the same one:
-  - "flat-list" format: one changed cell per line, "(row, col): before -> after", \
-real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex.
-  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
-the next N cells in that row are unchanged from the previous grid. "b>c" is a single \
-changed cell, hex digit before -> after (same 0-15 hex alphabet the color legend \
-above uses for grids — NOT real integers here, opposite of flat-list format). \
-"b>c*N" means the next N cells all made that SAME before->after change — do not \
-read it as N separate different changes, it is N cells that all changed identically.
+of two formats is more compact for that specific example — every example names \
+its own format inline, so read that name rather than assuming all examples use \
+the same one:
+  - "run-list" format: one line per contiguous rectangular block of identically-\
+changed cells, "(row R | rows R1-R2, col C | cols C1-C2): before -> after", real \
+integer values 0-15 — NOT hex digits, even though grids elsewhere use hex. A single \
+row and column range together describe every cell in that block; row/col \
+combinations not covered by any line did not change. Use the row/col numbers \
+directly — no need to count lines or sum anything yourself.
   - "in full": the whole resulting grid, same compact display format as the Starting \
-Grid above (hex/RLE per the encoding note) — used when showing the entire grid is \
-itself the most compact option, e.g. most of the grid changed at once.
+Grid above (row-labeled hex/RLE per the encoding note) — used when showing the entire \
+grid is itself the most compact option, e.g. most of the grid changed at once.
 
 {examples}
 
@@ -2240,8 +2273,26 @@ Write your GameModel class now.
 
 EXTEND_TEMPLATE = """You are given new, previously-unseen transitions from the SAME ARC-AGI-3 \
 game your class below was already built for. These are NOT failures — your class \
-simply hasn't seen these examples yet. Extend or adjust it so it also correctly \
-handles them, WITHOUT rewriting it from scratch.
+simply hasn't seen these examples yet.
+
+{overall_accuracy_note}
+
+First check whether your current class, as \
+written, already predicts them correctly — if so, return it unchanged, but still \
+update DESCRIPTION to confirm you checked rather than assumed. If it's wrong only \
+because these examples exercise a case your existing rules don't yet cover, extend \
+the existing logic to handle it without disturbing what already works. But if these \
+examples reveal that what your class tracks in previous_state — or how it structures \
+its rules — cannot represent what's actually happening in the game, not just a \
+missing case but a wrong picture of the state itself, then change that state \
+representation, even if it means restructuring the class. Weigh this against your \
+current class's overall accuracy stated above: a low figure despite several rounds of \
+patches is a strong signal that patching the rule again won't fix it, and the state \
+itself needs to change. Do not invent a special \
+case tied to this specific batch of examples (a hardcoded row/column/step number, or \
+a condition that only explains the examples shown) as a substitute for either of \
+these — that's neither a real rule extension nor a real state fix, it's memorizing \
+this round instead of modeling the game.
 
 Here is your current class:
 
@@ -2254,20 +2305,18 @@ Here is your current class:
 {action_vocabulary}
 
 Following the "Starting Grid", each example's changed cells are shown in whichever \
-of three formats is most compact for that specific example — every example names \
-its own format inline, so read that name and apply the matching rule below rather \
-than assuming all examples use the same one:
-  - "flat-list" format: one changed cell per line, "(row, col): before -> after", \
-real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex.
-  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
-the next N cells in that row are unchanged from the previous grid. "b>c" is a single \
-changed cell, hex digit before -> after (same 0-15 hex alphabet the color legend \
-above uses for grids — NOT real integers here, opposite of flat-list format). \
-"b>c*N" means the next N cells all made that SAME before->after change — do not \
-read it as N separate different changes, it is N cells that all changed identically.
+of two formats is more compact for that specific example — every example names \
+its own format inline, so read that name rather than assuming all examples use \
+the same one:
+  - "run-list" format: one line per contiguous rectangular block of identically-\
+changed cells, "(row R | rows R1-R2, col C | cols C1-C2): before -> after", real \
+integer values 0-15 — NOT hex digits, even though grids elsewhere use hex. A single \
+row and column range together describe every cell in that block; row/col \
+combinations not covered by any line did not change. Use the row/col numbers \
+directly — no need to count lines or sum anything yourself.
   - "in full": the whole resulting grid, same compact display format as the Starting \
-Grid above (hex/RLE per the encoding note) — used when showing the entire grid is \
-itself the most compact option, e.g. most of the grid changed at once.
+Grid above (row-labeled hex/RLE per the encoding note) — used when showing the entire \
+grid is itself the most compact option, e.g. most of the grid changed at once.
 
 {examples}
 
@@ -2313,29 +2362,24 @@ current class:
 {candidate_code}
 ```
 
+{overall_accuracy_note}
+
 {encoding_explanation}
 
 {status_notes}
 Each counterexample below shows a row your class has been failing on: your predicted \
 grid_after in full (when your class produced one — see the diff itself for what to do \
 when it didn't), plus a computed diff against the correct grid — exactly which cells \
-differ, and what the correct value is at each one, in whichever of two formats was \
-more compact for that specific counterexample (each one names its own format inline, \
-so read that name rather than assuming they're all the same). The correct grid_after \
-itself is NOT shown separately — your predicted grid is identical to it at every cell \
-NOT listed in the diff, and the diff gives you the correct value at every cell that \
-IS listed, so nothing is missing by only showing one grid:
-  - "flat-list" format: one differing cell per line, "(row, col): your prediction -> \
-correct", real integer values 0-15 — NOT hex digits.
-  - "masked-grid" format: one line per grid row, space-separated tokens. "*N" means \
-the next N cells in that row match between your prediction and the correct grid. \
-"b>c" is a single differing cell, hex digit your-prediction -> correct (same 0-15 \
-hex alphabet the color legend above uses for grids — NOT real integers here). \
-"b>c*N" means the next N cells all had that SAME your-prediction -> correct mismatch \
-— do not read it as N separate different mismatches, it is N cells that are all \
-wrong in the identical way.
-Use that directly to see where your rule diverges from the truth; you do not need to \
-manually compare grids cell-by-cell yourself. Each counterexample also states \
+differ, and what the correct value is at each one. The correct grid_after itself is \
+NOT shown separately — your predicted grid is identical to it at every cell NOT listed \
+in the diff, and the diff gives you the correct value at every cell that IS listed, so \
+nothing is missing by only showing one grid. The diff uses "run-list" format: one line \
+per contiguous rectangular block of identically-wrong cells, "(row R | rows R1-R2, col \
+C | cols C1-C2): your prediction -> correct", real integer values 0-15 — NOT hex \
+digits, even though grids elsewhere use hex. A single row and column range together \
+describe every cell in that block; row/col combinations not listed matched already. \
+Use the row/col numbers directly — no need to count lines or sum anything yourself. \
+Each counterexample also states \
 its own available actions — the legal action set can differ row to row (e.g. across a \
 level boundary) — AND the specific action that was actually taken on that row. Available \
 actions is the full legal set; action-taken is the one that actually fired. Use \
@@ -2347,7 +2391,23 @@ rows it's seen:
 {counterexamples}
 
 Revise your GameModel class so it correctly handles these cases while continuing to \
-handle the cases it already gets right, WITHOUT rewriting it from scratch. Your \
+handle the cases it already gets right. Two different kinds of fix are available, and \
+picking the right one matters: if these counterexamples are consistent with your \
+class's current picture of the game but reveal a gap in the rule itself (a case your \
+logic doesn't cover, or a formula that's slightly off), patch or extend the existing \
+logic, keeping what already works. If instead they reveal that what your class tracks \
+as game state cannot represent what's actually happening, restructure that state \
+representation, even if it means rewriting significant parts of the class — \
+preserving code that doesn't correctly model the game is not the goal. Weigh this \
+against your current class's overall accuracy stated above — a low figure despite \
+several rounds of patches, not just whether these specific rows are failing, is a \
+strong signal that patching the rule again won't fix it, and the state itself needs \
+to change. A high overall accuracy suggests these counterexamples are isolated gaps, \
+more likely fixable with a straightforward rule patch. Do not invent a special case tied to this specific batch of \
+counterexamples (a hardcoded row/column/step number, or a condition that only \
+explains the examples shown) as a substitute for either of these — that's neither a \
+real rule fix nor a real state fix, it's memorizing this round's examples instead of \
+modeling the game. Your \
 predict method must keep this exact signature:
 
     def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
@@ -2399,14 +2459,14 @@ def build_examples_block(records, encoding="hex", is_extend=False):
     example's resulting grid, already fully implied by the previous
     example's diff.
 
-    Each per-example diff independently picks whichever of three
-    representations renders shortest for THAT specific diff -- format_diff's
-    own flat-list-vs-masked-grid choice, further compared here against a
-    plain full-grid dump. No fixed cell-count threshold: see format_diff's
-    docstring for why a threshold can't generalize across games the way a
-    direct cost comparison does. Every block states inline which format it
-    used, since different examples in the same prompt can legitimately use
-    different ones.
+    Each per-example diff is rendered via format_diff's run-list format
+    (format_run_list_diff), then compared here against a plain full-grid
+    dump and whichever is shorter wins. No fixed cell-count threshold: a
+    direct rendered-length comparison is correct by construction for any
+    game's grid size and change pattern, with no per-game tuning required.
+    Every block states inline whether it used the run-list diff or the
+    full grid, since different examples in the same prompt can legitimately
+    go either way depending on how much changed.
 
     `is_extend` controls only the one extra "not the game's start" sentence
     (PROMPT_TEMPLATE calls with is_extend=False, EXTEND_TEMPLATE with
@@ -2451,7 +2511,7 @@ def build_examples_block(records, encoding="hex", is_extend=False):
     for i, rec in enumerate(records, start=1):
         label = f"Grid {i}"
         changes = diff_grid(rec["grid_before"], rec["grid_after"])
-        diff_format, diff_text = format_diff(changes, rec["grid_after"])
+        diff_format, diff_text = format_diff(changes)
         full_dump = encode_grid(rec["grid_after"], encoding)
 
         header = f"\n### {label} (trace step {rec['step']})\naction: {rec['action']}\n"
@@ -2466,8 +2526,8 @@ def build_examples_block(records, encoding="hex", is_extend=False):
                 f"{label} in full ({len(changes)} of {sum(len(r) for r in rec['grid_after'])} "
                 f"cells changed — showing the whole grid was cheaper than any diff "
                 f"representation for this one) — same compact display format as the "
-                f"Starting Grid above, NOT real integers or the masked-grid notation "
-                f"used elsewhere:\n{full_dump}\n"
+                f"Starting Grid above (row-labeled hex/RLE per the encoding note), NOT "
+                f"the real-integer run-list notation used elsewhere:\n{full_dump}\n"
             )
         else:
             block = header + (
@@ -2496,7 +2556,8 @@ def build_initial_prompt(records, max_examples, encoding="hex"):
     return prompt, len(sampled)
 
 
-def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_boundary=False):
+def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_boundary=False,
+                         current_best_n_pass=None, current_best_n_total=None):
     """
     Round-1 prompt for every chunk after the first. Shows the candidate's
     current class in full plus only this chunk's newly introduced rows —
@@ -2512,6 +2573,14 @@ def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_bo
     chunk only), not the whole trace — see format_chunk_action_vocabulary's
     docstring for why that's the intended scope, not a limitation.
 
+    current_best_n_pass/current_best_n_total feed build_overall_accuracy_note
+    — see that function's docstring for where these values come from and
+    why they're never None in the real run-chunked pipeline (this function
+    is chunk k>1 only, which always has a baseline recompute by the time
+    round 1 is built). Defaulted to None here purely so this function stays
+    callable in isolation (tests, manual debugging) without a live chunk
+    loop in scope; in that case the note falls back to reporting 0/0.
+
     If candidate_code still descends from FALLBACK_CANDIDATE_CODE (see
     _descends_from_fallback), NOOP_LINEAGE_WARNING is prepended and the
     stale marker sentence is stripped out of the embedded docstring before
@@ -2523,6 +2592,9 @@ def build_extend_prompt(candidate_code, new_records, encoding="hex", is_level_bo
         candidate_code = _strip_fallback_marker_sentence(candidate_code)
     return prefix + EXTEND_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
+        overall_accuracy_note=build_overall_accuracy_note(
+            current_best_n_pass or 0, current_best_n_total or 0
+        ),
         encoding_explanation=encoding_explanation(encoding),
         action_vocabulary=format_chunk_action_vocabulary(new_records),
         examples=build_examples_block(new_records, encoding=encoding, is_extend=True),
@@ -2564,6 +2636,45 @@ def select_top_k_failures(row_failure_counts, k):
     ]
     eligible.sort(key=lambda kv: (-kv[1]["count"], order_index[kv[0]]))
     return eligible[:k]
+
+
+def build_overall_accuracy_note(current_best_n_pass, current_best_n_total):
+    """
+    One-sentence summary of current-best code's most recent FULL backtest
+    accuracy, shown at the top of EXTEND_TEMPLATE/REVISE_TEMPLATE as the
+    single global "does this class's whole theory of the game hold up"
+    signal — distinct from any single example/counterexample's own
+    history, which isn't a reliable proxy for this (a per-row streak or
+    rate says nothing about whether a LATER round already fixed things
+    elsewhere, and isn't comparable across rows scored different numbers
+    of times over a long-running trace).
+
+    current_best_n_pass/current_best_n_total come from whichever backtest
+    result run_chunk_rounds has most recently in hand at the moment this
+    round is being built: the baseline recompute's result for round 1 of
+    chunk k>1 (already scored against the FULL current boundary, including
+    this chunk's brand-new rows — deliberately not excluded, since
+    whether the current class already handles them correctly is itself
+    part of "does the whole theory hold up"), or the immediately
+    preceding round's accepted result for every round after. This makes
+    the figure genuinely update within a single chunk — if an
+    EXTEND_TEMPLATE round successfully restructures the class, a
+    REVISE_TEMPLATE round later in that SAME chunk sees that improvement
+    reflected here, not a stale pre-chunk number.
+
+    Both args are required (never None) for every real call in the
+    run-chunked pipeline — EXTEND_TEMPLATE is only ever used for chunk
+    k>1, which always runs a baseline recompute before round 1, and
+    REVISE_TEMPLATE is only ever used after round 1 has already run. Only
+    chunk 1's round 1 (PROMPT_TEMPLATE) has no prior backtest to report,
+    and that path doesn't call this function at all.
+    """
+    pct = current_best_n_pass / current_best_n_total if current_best_n_total else 0.0
+    return (
+        f"As of the most recent full backtest of your current class, it passed "
+        f"{current_best_n_pass}/{current_best_n_total} rows ({pct:.0%}) checked so "
+        f"far — not just the examples/counterexamples shown below."
+    )
 
 
 def build_revise_status_notes(most_recent_passed):
@@ -2643,7 +2754,7 @@ def format_prediction_diff_section(predicted_grid, actual_grid):
             "somewhere in your class.\n"
         )
     diff = diff_grid(predicted_grid, actual_grid)
-    diff_format, diff_text = format_diff(diff, actual_grid)
+    diff_format, diff_text = format_diff(diff)
     return (
         f"cells where your prediction differs from the correct grid, {diff_format} "
         f"format (your prediction -> correct):\n{diff_text}\n"
@@ -2676,9 +2787,9 @@ def format_grid_and_diff_section(predicted_grid, actual_grid, encoding):
 def build_revise_row_block(i, step_key, entry, encoding="hex"):
     """
     Render one selected row_failure_counts.json entry as a counterexample.
-    Built entirely from the entry's own fields — count, actual_grid/
-    actual_goal/action (ground truth), predicted_grid/predicted_goal/error
-    (most recent attempt), available_actions_before (ground truth, see
+    Built entirely from the entry's own fields — actual_grid/actual_goal/
+    action (ground truth), predicted_grid/predicted_goal/error (most
+    recent attempt), available_actions_before (ground truth, see
     run_backtest) — no grid_before is available in this schema, so the
     diff shown here is between the predicted grid and the correct grid
     directly, not a before/after transition diff. action IS available
@@ -2689,6 +2800,16 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
     entry.get("action") rather than direct indexing, since a
     row_failure_counts.json written before this field existed won't carry
     it — shown as "not recorded" in that case, not silently omitted.
+
+    Deliberately does NOT show entry["count"] (this row's own current
+    failure streak) or any other per-row persistence stat in the header —
+    a per-row number here is misleading as a "should the class be
+    restructured" signal (a row's streak/history says nothing about
+    whether a LATER round already fixed the underlying issue elsewhere,
+    and is not comparable across rows scored different numbers of times).
+    That signal now lives at the top of REVISE_TEMPLATE/EXTEND_TEMPLATE
+    instead, as a single trace-wide accuracy figure from the most recent
+    full backtest — see build_overall_accuracy_note.
 
     Three distinct cases:
       - False-positive goal (predicted_goal=True, actual_goal=False):
@@ -2705,7 +2826,6 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
     A row that crashed/timed out (error is not None) is called out
     separately regardless of which of the above it would otherwise be.
     """
-    count = entry.get("count", 0)
     actual_grid = entry["actual_grid"]
     actual_goal = entry["actual_goal"]
     predicted_grid = entry.get("predicted_grid")
@@ -2714,7 +2834,7 @@ def build_revise_row_block(i, step_key, entry, encoding="hex"):
 
     action_taken = entry.get("action")
     header = (
-        f"### Counterexample {i} (trace step {step_key}, failed {count}x so far)\n"
+        f"### Counterexample {i} (trace step {step_key})\n"
         f"{format_row_available_actions(entry.get('available_actions_before'))}\n"
         f"action actually taken on this row: {action_taken if action_taken is not None else 'not recorded (row scored before this field existed)'}\n"
     )
@@ -2761,7 +2881,8 @@ def build_row_counterexamples_block(selected, encoding="hex"):
     )
 
 
-def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"):
+def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex",
+                         current_best_n_pass=None, current_best_n_total=None):
     """
     Revision-round prompt builder for the chunked design — takes a
     persistent row_failure_counts.json record rather than a pre-selected
@@ -2776,6 +2897,16 @@ def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"
     commit/revert has already run for any prior round in this chunk. This
     function trusts the dict handed to it and does no commit/revert
     bookkeeping of its own.
+
+    current_best_n_pass/current_best_n_total feed build_overall_accuracy_note
+    — see that function's docstring for where these values come from (the
+    immediately preceding round's accepted result) and why they're never
+    None in the real run-chunked pipeline (REVISE_TEMPLATE is only ever
+    used after round 1 has already established them). Defaulted to None
+    here purely so this function stays callable in isolation (tests, the
+    standalone `revise-prompt` CLI command, manual debugging) without a
+    live chunk loop in scope; in that case the note falls back to
+    reporting 0/0 rather than raising.
 
     Two distinct "not enough rows" situations, handled differently on
     purpose:
@@ -2834,6 +2965,9 @@ def build_revise_prompt(candidate_code, row_failure_counts, k=10, encoding="hex"
 
     return prefix + REVISE_TEMPLATE.format(
         candidate_code=candidate_code.strip(),
+        overall_accuracy_note=build_overall_accuracy_note(
+            current_best_n_pass or 0, current_best_n_total or 0
+        ),
         encoding_explanation=encoding_explanation(encoding),
         status_notes=build_revise_status_notes(most_recent_passed),
         counterexamples=build_row_counterexamples_block(selected, encoding=encoding),
@@ -3353,7 +3487,8 @@ def _validate_candidate_code(code, round_label, class_name="GameModel", method_n
 def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_boundary,
                         records, counts_path, workdir, llm_call, tokenize, encoding, args, run_state):
     """
-    Builds the round_builder(round_n, current_best_code) -> candidate_code
+    Builds the round_builder(round_n, current_best_code, current_best_n_pass,
+    current_best_n_total) -> candidate_code
     callback run_chunk_rounds expects, closing over everything one chunk's
     worth of rounds needs: which template to build (PROMPT_TEMPLATE for
     chunk 1's round 1, EXTEND_TEMPLATE for round 1 of every later chunk
@@ -3362,6 +3497,13 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
     keeps counts_path in lockstep with current_best_code between rounds —
     for every round after), the live LLM call, code extraction/trimming,
     and per-round prompt/candidate files under --workdir for inspection.
+
+    current_best_n_pass/current_best_n_total (see run_chunk_rounds and
+    build_overall_accuracy_note) are None only for chunk 1's round 1
+    (PROMPT_TEMPLATE, which doesn't use them at all — build_initial_prompt
+    takes no such argument, since there's no prior backtest to report on a
+    first attempt); passed straight through to build_extend_prompt/
+    build_revise_prompt for every other round.
 
     run_state is a small shared mutable dict — currently just
     {"interrupted": bool} — used to carry a Ctrl+C signal out to the outer
@@ -3373,7 +3515,7 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
     up to (max_rounds - 1) more LLM calls complete before the run actually
     stops after a Ctrl+C.
     """
-    def round_builder(round_n, current_best_code):
+    def round_builder(round_n, current_best_code, current_best_n_pass, current_best_n_total):
         if round_n == 1:
             if chunk_number == 1:
                 prompt_text, _ = build_initial_prompt(records, boundary, encoding=encoding)
@@ -3383,6 +3525,8 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
                 prompt_text = build_extend_prompt(
                     current_best_code, new_records, encoding=encoding,
                     is_level_boundary=lagged_level_boundary,
+                    current_best_n_pass=current_best_n_pass,
+                    current_best_n_total=current_best_n_total,
                 )
                 round_label = f"Chunk {chunk_number} Round {round_n}: Extend Prompt"
         else:
@@ -3397,7 +3541,11 @@ def make_round_builder(chunk_number, prev_boundary, boundary, lagged_level_bound
             # under perfectly ordinary conditions -- not a sign anything's
             # actually wrong.
             effective_k = min(args.k, len(row_failure_counts))
-            prompt_text = build_revise_prompt(current_best_code, row_failure_counts, k=effective_k, encoding=encoding)
+            prompt_text = build_revise_prompt(
+                current_best_code, row_failure_counts, k=effective_k, encoding=encoding,
+                current_best_n_pass=current_best_n_pass,
+                current_best_n_total=current_best_n_total,
+            )
             round_label = f"Chunk {chunk_number} Round {round_n}: Revision Prompt"
 
         prompt_path = workdir / f"chunk{chunk_number}_prompt_round{round_n}.txt"
