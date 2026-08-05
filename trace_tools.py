@@ -2989,7 +2989,7 @@ def estimate_tokens_fallback(text):
     return len(text)
 
 
-def extract_code(text):
+def extract_code(text, class_name="GameModel"):
     """
     Pull code out of a ```python ... ``` fence if present, else assume the
     whole reply is code. Handles a truncated response (generation cut off by
@@ -2998,10 +2998,36 @@ def extract_code(text):
     failed to match, and the fallback path kept the literal opening ```python
     marker as part of "code", guaranteeing an immediate SyntaxError on line 1
     instead of surfacing the actual (truncated/incomplete) candidate body.
+
+    A response can contain MORE THAN ONE fenced block: a model that reasons
+    at length before answering will sometimes drop small illustrative
+    snippets ("roughly like this: ```python ... ```") in the middle of its
+    explanation, well before it ever writes the real class -- and those
+    snippets are frequently not even valid standalone statements. Taking
+    the first fence in the text (the old behavior) grabs whichever of
+    these comes first, not the model's actual answer; the real class
+    later in the same response -- complete, or even just truncated by
+    --max-tokens -- gets silently discarded, and _validate_candidate_code
+    rejects the snippet as a SyntaxError for the wrong underlying reason,
+    substituting the NOOP fallback when a real candidate was available.
+
+    To avoid this, every fenced block in the response is collected in
+    order, and the first one that actually contains a `class {class_name}`
+    definition is returned. Only if none of them do (or there are no
+    fences at all) does this fall back to the old first-fence/whole-text
+    behavior, so non-class responses (or single-fence responses, the
+    common case) are handled exactly as before.
     """
     import re
-    m = re.search(r"```(?:python)?\s*\n?(.*?)(?:```|\Z)", text, re.DOTALL)
-    return m.group(1).strip() if m else text.strip()
+    fence_re = re.compile(r"```(?:python)?\s*\n?(.*?)(?:```|\Z)", re.DOTALL)
+    blocks = [m.group(1) for m in fence_re.finditer(text)]
+    if not blocks:
+        return text.strip()
+    class_re = re.compile(r"^[ \t]*class[ \t]+" + re.escape(class_name) + r"\b", re.MULTILINE)
+    for block in blocks:
+        if class_re.search(block):
+            return block.strip()
+    return blocks[0].strip()
 
 
 def keep_first_class_def(source, class_name="GameModel"):
