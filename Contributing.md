@@ -13,6 +13,16 @@ A few things worth knowing before you dive in:
 - `SECURITY.md` explains the sandboxing setup and why it exists.
 - The "Known Limitations" section at the end of each implementation plan is a running list of things that were tried and didn't pan out, or gaps that are still open. It's worth a skim before proposing something new — there's a decent chance an idea has already been tried, and knowing why it didn't work will save you some time. We've already been through a few rounds of "this looked right until we checked it against real data" on some of these, so there are probably more problems we haven't found yet either — that's normal, not a sign anything's broken.
 
+## Contributor agreement
+
+Contributions here are volunteer. There's no equity, compensation, or other consideration implied or promised for contributing code, tests, docs, or anything else to this repo — Eidolon is, and is intended to stay, open source under MIT. If you're contributing with an expectation of future equity, a paid role, or a cofounder-type relationship if this ever turns into a company, say so and let's have that conversation explicitly and separately — don't assume it's implied by the act of contributing.
+
+This project uses the **Developer Certificate of Origin (DCO)** instead of a copyright-assignment CLA. Practically, that means:
+
+- Every commit needs a `Signed-off-by` line, added automatically with `git commit -s`. This certifies you wrote the contribution (or otherwise have the right to submit it under the project's license) — see [`DCO.txt`](./DCO.txt) (mirrored from [developercertificate.org](https://developercertificate.org)) for the exact text you're agreeing to. This automatically appends your signature to the bottom of the commit message: `Signed-off-by: John Doe <john.doe@example.com>`
+- You keep copyright on your own contributions. Signing off licenses your contribution to the project (and everyone downstream) under MIT — it doesn't transfer ownership. This is deliberate: no single party, including a future company built by anyone involved with this project, can ever take the whole codebase private without going back to get every contributor's consent first.
+- If you have an employer, it's worth actually checking your employment agreement's IP-assignment clause before contributing, especially if your work relates in any way to what your employer does. Many employment contracts claim rights to work created during employment — including personal-time work, in some cases — and being open source doesn't exempt a contribution from that if it was never yours to give away in the first place. A few states have carve-outs for personal projects unrelated to your employer's business, but the details vary and "unrelated" is doing real work in that sentence. This is worth five minutes of your own attention, not something the DCO checkbox verifies for you.
+
 ## Trying something new
 
 Small fixes, tests, docs, and extensions to something that already exists: normal pull request, no extra process needed.

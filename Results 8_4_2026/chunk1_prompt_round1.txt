@@ -1,0 +1,347 @@
+You are given a sequence of observed transitions from an ARC-AGI-3 game. Each example shows a grid, an action taken, and the resulting grid.
+
+IMPORTANT — display format vs. real data: grids below are shown one row per line, run-length encoded as a compact display shorthand only. Each line is prefixed with "R<n>| " stating that line's row number (e.g. "R 7|") — this prefix is a display aid only, not grid data; do not count it as a cell. After the prefix, each row is a space-separated sequence of "<digit>*<count>" runs, where <digit> is a single hexadecimal digit standing in for one integer color value 0-15 (0-9 mean themselves; a=10, b=11, c=12, d=13, e=14, f=15) and <count> is how many times that value repeats consecutively. For example the line "R 2| 0*7 3*2" represents row 2 as the actual list [0, 0, 0, 0, 0, 0, 0, 3, 3]. The function you write never sees or returns this run-length notation or the row-number prefix — it always works with real Python integers.
+
+The actions available for this chunk of examples are: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4.
+
+Your task: write a single Python class with this exact shape:
+
+    class GameModel:
+        def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+            ...
+
+predict must return a 3-tuple (predicted_grid_after, goal, state):
+  - predicted_grid_after: list[list[int]], your prediction for the grid after taking the given action from grid_before.
+  - goal: bool, True if you predict this action reaches the next level, False otherwise.
+  - state: dict, JSON-serializable (plain dicts/lists/numbers only) — everything you want carried forward into your NEXT predict() call as previous_state. On the very first call of a fresh rollout, previous_state is an empty dict {}. Your class must not raise a KeyError on that call — use previous_state.get("your_key", <default>) instead of previous_state["your_key"]. Store whatever state you choose to track under keys of your own choosing, but don't assume any of them already exist the first time predict() runs.
+
+grid_before is always a list of lists of plain integers 0-15 — never the compact display notation shown above, whichever form it takes — and predicted_grid_after must be in that same form. Infer the transformation rule(s) from the examples below by mentally converting each displayed row back to its real integer list first. Your class may define as many additional methods/fields as it needs; only predict's signature is fixed. You may only import: copy, itertools, math, collections, functools, and numpy — no other modules, standard library or third-party. Return only the class definition, no explanation, no example usage.
+
+Define GameModel exactly ONCE, and define each of its methods exactly ONCE. Do not write multiple draft attempts, "actually, let me try again" rewrites, or alternate versions — pick your best hypothesis and write a single, complete, syntactically valid class for it. Every if/elif/else branch and every loop body must contain a real statement (return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
+
+Do not re-examine the same examples repeatedly or restate your reasoning multiple times — if your first hypothesis doesn't perfectly fit every example, write your best guess anyway and move on. You will see new examples and counterexamples and get a chance to fix mistakes in later rounds, so an imperfect-but-complete class now is far more useful than a perfect rule you never finish writing.
+
+Following the "Starting Grid", each example's changed cells are shown in whichever of two formats is more compact for that specific example — every example names its own format inline, so read that name rather than assuming all examples use the same one:
+  - "run-list" format: one line per contiguous rectangular block of identically-changed cells, "(row R | rows R1-R2, col C | cols C1-C2): before -> after", real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex. A single row and column range together describe every cell in that block; row/col combinations not covered by any line did not change. Use the row/col numbers directly — no need to count lines or sum anything yourself.
+  - "in full": the whole resulting grid, same compact display format as the Starting Grid above (row-labeled hex/RLE per the encoding note) — used when showing the entire grid is itself the most compact option, e.g. most of the grid changed at once.
+
+The examples below form one continuous sequence, not independent snapshots.
+"Starting Grid" is the earliest state in this batch.
+
+Starting Grid:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*20 4*10
+R41| 5*4 4*15 3*5 4*10 3*20 4*10
+R42| 5*4 4*15 3*5 4*10 3*20 4*10
+R43| 5*4 4*15 3*5 4*10 3*20 4*10
+R44| 5*4 4*15 3*5 4*10 3*20 4*10
+R45| 5*4 4*15 3*15 c*5 3*15 4*10
+R46| 5*4 4*15 3*15 c*5 3*15 4*10
+R47| 5*4 4*15 3*15 9*5 3*15 4*10
+R48| 5*4 4*15 3*15 9*5 3*15 4*10
+R49| 5*4 4*15 3*15 9*5 3*15 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 b*42 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 b*42 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+
+
+### Grid 1 (trace step 0)
+action: GameAction.ACTION1
+changed cells (Starting Grid -> Grid 1), run-list format (see the format note above for how to read this):
+(rows 40-41, cols 34-38): 3 -> 12
+(rows 42-44, cols 34-38): 3 -> 9
+(rows 45-46, cols 34-38): 12 -> 3
+(rows 47-49, cols 34-38): 9 -> 3
+(rows 61-62, col 13): 11 -> 3
+
+
+### Grid 2 (trace step 1)
+action: GameAction.ACTION3
+changed cells (Grid 1 -> Grid 2), run-list format (see the format note above for how to read this):
+(rows 61-62, col 14): 11 -> 3
+
+
+### Grid 3 (trace step 2)
+action: GameAction.ACTION4
+changed cells (Grid 2 -> Grid 3), run-list format (see the format note above for how to read this):
+(rows 40-41, cols 34-38): 12 -> 3
+(rows 40-41, cols 39-43): 3 -> 12
+(rows 42-44, cols 34-38): 9 -> 3
+(rows 42-44, cols 39-43): 3 -> 9
+(rows 61-62, col 15): 11 -> 3
+
+
+### Grid 4 (trace step 3)
+action: GameAction.ACTION4
+changed cells (Grid 3 -> Grid 4), run-list format (see the format note above for how to read this):
+(rows 40-41, cols 39-43): 12 -> 3
+(rows 40-41, cols 44-48): 3 -> 12
+(rows 42-44, cols 39-43): 9 -> 3
+(rows 42-44, cols 44-48): 3 -> 9
+(rows 61-62, col 16): 11 -> 3
+
+
+### Grid 5 (trace step 4)
+action: GameAction.ACTION4
+changed cells (Grid 4 -> Grid 5), run-list format (see the format note above for how to read this):
+(rows 40-41, cols 44-48): 12 -> 3
+(rows 40-41, cols 49-53): 3 -> 12
+(rows 42-44, cols 44-48): 9 -> 3
+(rows 42-44, cols 49-53): 3 -> 9
+(rows 61-62, col 17): 11 -> 3
+
+
+### Grid 6 (trace step 5)
+action: GameAction.ACTION4
+changed cells (Grid 5 -> Grid 6), run-list format (see the format note above for how to read this):
+(rows 61-62, col 18): 11 -> 3
+
+
+### Grid 7 (trace step 6)
+action: GameAction.ACTION1
+changed cells (Grid 6 -> Grid 7), run-list format (see the format note above for how to read this):
+(rows 35-36, cols 49-53): 3 -> 12
+(rows 37-39, cols 49-53): 3 -> 9
+(rows 40-41, cols 49-53): 12 -> 3
+(rows 42-44, cols 49-53): 9 -> 3
+(rows 61-62, col 19): 11 -> 3
+
+
+### Grid 8 (trace step 7)
+action: GameAction.ACTION1
+changed cells (Grid 7 -> Grid 8), run-list format (see the format note above for how to read this):
+(rows 30-31, cols 49-53): 3 -> 12
+(rows 32-34, cols 49-53): 3 -> 9
+(rows 35-36, cols 49-53): 12 -> 3
+(rows 37-39, cols 49-53): 9 -> 3
+(rows 61-62, col 20): 11 -> 3
+
+
+### Grid 9 (trace step 8)
+action: GameAction.ACTION1
+changed cells (Grid 8 -> Grid 9), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 49-53): 3 -> 12
+(rows 27-29, cols 49-53): 3 -> 9
+(rows 30-31, cols 49-53): 12 -> 3
+(rows 32-34, cols 49-53): 9 -> 3
+(rows 61-62, col 21): 11 -> 3
+
+
+### Grid 10 (trace step 9)
+action: GameAction.ACTION3
+changed cells (Grid 9 -> Grid 10), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 44-48): 3 -> 12
+(rows 25-26, cols 49-53): 12 -> 3
+(rows 27-29, cols 44-48): 3 -> 9
+(rows 27-29, cols 49-53): 9 -> 3
+(rows 61-62, col 22): 11 -> 3
+
+
+### Grid 11 (trace step 10)
+action: GameAction.ACTION3
+changed cells (Grid 10 -> Grid 11), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 39-43): 3 -> 12
+(rows 25-26, cols 44-48): 12 -> 3
+(rows 27-29, cols 39-43): 3 -> 9
+(rows 27-29, cols 44-48): 9 -> 3
+(rows 61-62, col 23): 11 -> 3
+
+
+### Grid 12 (trace step 11)
+action: GameAction.ACTION3
+changed cells (Grid 11 -> Grid 12), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 34-38): 3 -> 12
+(rows 25-26, cols 39-43): 12 -> 3
+(rows 27-29, cols 34-38): 3 -> 9
+(rows 27-29, cols 39-43): 9 -> 3
+(rows 61-62, col 24): 11 -> 3
+
+
+### Grid 13 (trace step 12)
+action: GameAction.ACTION3
+changed cells (Grid 12 -> Grid 13), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 29-33): 3 -> 12
+(rows 25-26, cols 34-38): 12 -> 3
+(rows 27-29, cols 29-33): 3 -> 9
+(rows 27-29, cols 34-38): 9 -> 3
+(rows 61-62, col 25): 11 -> 3
+
+
+### Grid 14 (trace step 13)
+action: GameAction.ACTION3
+changed cells (Grid 13 -> Grid 14), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 24-28): 3 -> 12
+(rows 25-26, cols 29-33): 12 -> 3
+(rows 27-29, cols 24-28): 3 -> 9
+(rows 27-29, cols 29-33): 9 -> 3
+(rows 61-62, col 26): 11 -> 3
+
+
+### Grid 15 (trace step 14)
+action: GameAction.ACTION2
+changed cells (Grid 14 -> Grid 15), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 24-28): 12 -> 3
+(rows 27-29, cols 24-28): 9 -> 3
+(rows 30-31, cols 24-28): 3 -> 12
+(rows 32-34, cols 24-28): 3 -> 9
+(rows 61-62, col 27): 11 -> 3
+
+
+### Grid 16 (trace step 15)
+action: GameAction.ACTION4
+changed cells (Grid 15 -> Grid 16), run-list format (see the format note above for how to read this):
+(rows 61-62, col 28): 11 -> 3
+
+
+### Grid 17 (trace step 16)
+action: GameAction.ACTION3
+changed cells (Grid 16 -> Grid 17), run-list format (see the format note above for how to read this):
+(row 30, cols 19-23): 3 -> 12
+(row 30, cols 24-28): 12 -> 3
+(row 31, cols 19-20): 3 -> 12
+(row 31, col 21): 0 -> 12
+(row 31, cols 22-23): 3 -> 12
+(row 31, cols 24-28): 12 -> 3
+(row 32, col 19): 3 -> 9
+(row 32, col 20): 1 -> 9
+(row 32, cols 21-22): 0 -> 9
+(row 32, col 23): 3 -> 9
+(row 32, cols 24-28): 9 -> 3
+(row 33, cols 19-20): 3 -> 9
+(row 33, col 21): 1 -> 9
+(row 33, cols 22-23): 3 -> 9
+(row 33, cols 24-28): 9 -> 3
+(row 34, cols 19-23): 3 -> 9
+(row 34, cols 24-28): 9 -> 3
+(rows 57-58, cols 3-4): 9 -> 5
+(rows 57-58, cols 7-8): 5 -> 9
+
+
+### Grid 18 (trace step 17)
+action: GameAction.ACTION4
+changed cells (Grid 17 -> Grid 18), run-list format (see the format note above for how to read this):
+(row 30, cols 19-23): 12 -> 3
+(row 30, cols 24-28): 3 -> 12
+(row 31, cols 19-20): 12 -> 3
+(row 31, col 21): 12 -> 0
+(row 31, cols 22-23): 12 -> 3
+(row 31, cols 24-28): 3 -> 12
+(row 32, col 19): 9 -> 3
+(row 32, col 20): 9 -> 1
+(row 32, cols 21-22): 9 -> 0
+(row 32, col 23): 9 -> 3
+(row 32, cols 24-28): 3 -> 9
+(row 33, cols 19-20): 9 -> 3
+(row 33, col 21): 9 -> 1
+(row 33, cols 22-23): 9 -> 3
+(row 33, cols 24-28): 3 -> 9
+(row 34, cols 19-23): 9 -> 3
+(row 34, cols 24-28): 3 -> 9
+(rows 61-62, col 29): 11 -> 3
+
+
+### Grid 19 (trace step 18)
+action: GameAction.ACTION3
+changed cells (Grid 18 -> Grid 19), run-list format (see the format note above for how to read this):
+(row 30, cols 19-23): 3 -> 12
+(row 30, cols 24-28): 12 -> 3
+(row 31, cols 19-20): 3 -> 12
+(row 31, col 21): 0 -> 12
+(row 31, cols 22-23): 3 -> 12
+(row 31, cols 24-28): 12 -> 3
+(row 32, col 19): 3 -> 9
+(row 32, col 20): 1 -> 9
+(row 32, cols 21-22): 0 -> 9
+(row 32, col 23): 3 -> 9
+(row 32, cols 24-28): 9 -> 3
+(row 33, cols 19-20): 3 -> 9
+(row 33, col 21): 1 -> 9
+(row 33, cols 22-23): 3 -> 9
+(row 33, cols 24-28): 9 -> 3
+(row 34, cols 19-23): 3 -> 9
+(row 34, cols 24-28): 9 -> 3
+(rows 55-56, cols 5-6): 9 -> 5
+(rows 59-60, cols 5-6): 5 -> 9
+(rows 61-62, col 30): 11 -> 3
+
+
+### Grid 20 (trace step 19)
+action: GameAction.ACTION1
+changed cells (Grid 19 -> Grid 20), run-list format (see the format note above for how to read this):
+(rows 25-26, cols 19-23): 3 -> 12
+(rows 27-29, cols 19-23): 3 -> 9
+(row 30, cols 19-23): 12 -> 3
+(row 31, cols 19-20): 12 -> 3
+(row 31, col 21): 12 -> 0
+(row 31, cols 22-23): 12 -> 3
+(row 32, col 19): 9 -> 3
+(row 32, col 20): 9 -> 1
+(row 32, cols 21-22): 9 -> 0
+(row 32, col 23): 9 -> 3
+(row 33, cols 19-20): 9 -> 3
+(row 33, col 21): 9 -> 1
+(row 33, cols 22-23): 9 -> 3
+(row 34, cols 19-23): 9 -> 3
+(rows 61-62, col 31): 11 -> 3
+
+
+Before writing any code, describe the objects in the grid using less than 200 words. Note: multiple objects can be of the same type and an object can have multiple color values. Also, distinct objects tend to take up less than 20% of the grid's values but there are exceptions to this. There are four steps to accomplishing this task:
+1: First, look at the color values in the "Starting Grid". Notice the shapes. Notice any objects that stand out with color values different from whatever colors dominate most of the grid (background regions).
+2: Second, from the changed-cell lists above, notice any objects that have moved or changed.
+3: Third, you may guess the purpose that each object has in the grid. Examples of object purposes are "player-movable object", "goal destination for player-movable object", and "object that changes another object's shape or color" (these are just examples — there may be other kinds of objects/purposes).
+4: Fourth, decide what — if anything — cannot be determined from a single grid_before/action pair alone, and must be carried forward via previous_state instead (e.g. a counter, a position or phase the grid doesn't otherwise reveal, something that only makes sense in light of prior steps). Track only what you have real evidence requires memory — do not add state "just in case". State this reasoning explicitly: what you chose to track, and why the grid alone isn't enough for it. This matters beyond just this class working now — if a later revision finds your predictions failing in a way your current state can't explain, that is a signal the state itself needs to change, not just the rule acting on it, and your reasoning here is what a later round will need to reconsider.
+Write this as a comment/docstring in your class with label "DESCRIPTION:" so it carries forward to future revisions.
+
+Reminder: predict() takes and returns plain Python int grids at runtime, never the display notation used above to show you the examples.
+
+Write your GameModel class now.
