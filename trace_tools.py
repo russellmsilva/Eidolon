@@ -86,9 +86,9 @@ Usage:
   python trace_tools.py revise-prompt candidate.py row_failure_counts.json revision_prompt.txt --k 10
   python trace_tools.py run-chunked clean.jsonl \\
       --backend llama-cpp --model-path /path/to/model.Q4_K_M.gguf \\
-      --n-gpu-layers -1 --n-ctx 32768 --max-examples 25 --max-rounds 2 \\
+      --n-gpu-layers -1 --n-ctx 131072 --max-examples 20 --max-rounds 2 \\
       --compact --repeat-penalty 1.3 --frequency-penalty 0.1 --presence-penalty 0.1 \\
-      --workdir chunked_run --automatic
+      --workdir chunked_run --verbose-llama
 """
 import argparse
 import json

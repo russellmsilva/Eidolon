@@ -1,0 +1,776 @@
+This class is a NOOP class. Completely replace it with new logic based on the examples/counterexamples below, including a fresh DESCRIPTION of what your new code actually does -- do not preserve any of its existing docstring text, comments, or reasoning. For this round only, ignore the instruction elsewhere to revise rather than rewrite from scratch.
+
+Your current GameModel class got some transitions wrong. Here is the current class:
+
+```python
+class GameModel:
+    """"""
+    def predict(self, grid_before, action, previous_state):
+        return grid_before, False, previous_state
+```
+
+As of the most recent full backtest of your current class, it passed 1/40 rows (2%) checked so far — not just the examples/counterexamples shown below.
+
+IMPORTANT — display format vs. real data: grids below are shown one row per line, run-length encoded as a compact display shorthand only. Each line is prefixed with "R<n>| " stating that line's row number (e.g. "R 7|") — this prefix is a display aid only, not grid data; do not count it as a cell. After the prefix, each row is a space-separated sequence of "<digit>*<count>" runs, where <digit> is a single hexadecimal digit standing in for one integer color value 0-15 (0-9 mean themselves; a=10, b=11, c=12, d=13, e=14, f=15) and <count> is how many times that value repeats consecutively. For example the line "R 2| 0*7 3*2" represents row 2 as the actual list [0, 0, 0, 0, 0, 0, 0, 3, 3]. The function you write never sees or returns this run-length notation or the row-number prefix — it always works with real Python integers.
+
+The single most recent row of the current row range was predicted INCORRECTLY.
+
+Each counterexample below shows a row your class has been failing on: your predicted grid_after in full (when your class produced one — see the diff itself for what to do when it didn't), plus a computed diff against the correct grid — exactly which cells differ, and what the correct value is at each one. The correct grid_after itself is NOT shown separately — your predicted grid is identical to it at every cell NOT listed in the diff, and the diff gives you the correct value at every cell that IS listed, so nothing is missing by only showing one grid. The diff uses "run-list" format: one line per contiguous rectangular block of identically-wrong cells, "(row R | rows R1-R2, col C | cols C1-C2): your prediction -> correct", real integer values 0-15 — NOT hex digits, even though grids elsewhere use hex. A single row and column range together describe every cell in that block; row/col combinations not listed matched already. Use the row/col numbers directly — no need to count lines or sum anything yourself. Each counterexample also states its own available actions — the legal action set can differ row to row (e.g. across a level boundary) — AND the specific action that was actually taken on that row. Available actions is the full legal set; action-taken is the one that actually fired. Use action-taken to tell whether a mismatch is tied to a specific action, or happens regardless of which action fires. These rows are selected because your class has failed on them most persistently across the WHOLE trace so far, not just the newest rows it's seen:
+
+### Counterexample 1 (trace step 0)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION1
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*20 4*10
+R41| 5*4 4*15 3*5 4*10 3*20 4*10
+R42| 5*4 4*15 3*5 4*10 3*20 4*10
+R43| 5*4 4*15 3*5 4*10 3*20 4*10
+R44| 5*4 4*15 3*5 4*10 3*20 4*10
+R45| 5*4 4*15 3*15 c*5 3*15 4*10
+R46| 5*4 4*15 3*15 c*5 3*15 4*10
+R47| 5*4 4*15 3*15 9*5 3*15 4*10
+R48| 5*4 4*15 3*15 9*5 3*15 4*10
+R49| 5*4 4*15 3*15 9*5 3*15 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 b*42 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 b*42 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 40-41, cols 34-38): 3 -> 12
+(rows 42-44, cols 34-38): 3 -> 9
+(rows 45-46, cols 34-38): 12 -> 3
+(rows 47-49, cols 34-38): 9 -> 3
+(rows 61-62, col 13): 11 -> 3
+
+### Counterexample 2 (trace step 1)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION3
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 c*5 3*15 4*10
+R41| 5*4 4*15 3*5 4*10 c*5 3*15 4*10
+R42| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R43| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R44| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*1 b*41 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*1 b*41 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 61-62, col 14): 11 -> 3
+
+### Counterexample 3 (trace step 2)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION4
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 c*5 3*15 4*10
+R41| 5*4 4*15 3*5 4*10 c*5 3*15 4*10
+R42| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R43| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R44| 5*4 4*15 3*5 4*10 9*5 3*15 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*2 b*40 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*2 b*40 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 40-41, cols 34-38): 12 -> 3
+(rows 40-41, cols 39-43): 3 -> 12
+(rows 42-44, cols 34-38): 9 -> 3
+(rows 42-44, cols 39-43): 3 -> 9
+(rows 61-62, col 15): 11 -> 3
+
+### Counterexample 4 (trace step 3)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION4
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*5 c*5 3*10 4*10
+R41| 5*4 4*15 3*5 4*10 3*5 c*5 3*10 4*10
+R42| 5*4 4*15 3*5 4*10 3*5 9*5 3*10 4*10
+R43| 5*4 4*15 3*5 4*10 3*5 9*5 3*10 4*10
+R44| 5*4 4*15 3*5 4*10 3*5 9*5 3*10 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*3 b*39 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*3 b*39 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 40-41, cols 39-43): 12 -> 3
+(rows 40-41, cols 44-48): 3 -> 12
+(rows 42-44, cols 39-43): 9 -> 3
+(rows 42-44, cols 44-48): 3 -> 9
+(rows 61-62, col 16): 11 -> 3
+
+### Counterexample 5 (trace step 4)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION4
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*10 c*5 3*5 4*10
+R41| 5*4 4*15 3*5 4*10 3*10 c*5 3*5 4*10
+R42| 5*4 4*15 3*5 4*10 3*10 9*5 3*5 4*10
+R43| 5*4 4*15 3*5 4*10 3*10 9*5 3*5 4*10
+R44| 5*4 4*15 3*5 4*10 3*10 9*5 3*5 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*4 b*38 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*4 b*38 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 40-41, cols 44-48): 12 -> 3
+(rows 40-41, cols 49-53): 3 -> 12
+(rows 42-44, cols 44-48): 9 -> 3
+(rows 42-44, cols 49-53): 3 -> 9
+(rows 61-62, col 17): 11 -> 3
+
+### Counterexample 6 (trace step 5)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION4
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*15 c*5 4*10
+R41| 5*4 4*15 3*5 4*10 3*15 c*5 4*10
+R42| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R43| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R44| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*5 b*37 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*5 b*37 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 61-62, col 18): 11 -> 3
+
+### Counterexample 7 (trace step 6)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION1
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*15 c*5 4*10
+R41| 5*4 4*15 3*5 4*10 3*15 c*5 4*10
+R42| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R43| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R44| 5*4 4*15 3*5 4*10 3*15 9*5 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*6 b*36 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*6 b*36 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 35-36, cols 49-53): 3 -> 12
+(rows 37-39, cols 49-53): 3 -> 9
+(rows 40-41, cols 49-53): 12 -> 3
+(rows 42-44, cols 49-53): 9 -> 3
+(rows 61-62, col 19): 11 -> 3
+
+### Counterexample 8 (trace step 7)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION1
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*15 c*5 4*10
+R36| 5*4 4*10 3*15 4*5 3*15 c*5 4*10
+R37| 5*4 4*10 3*15 4*5 3*15 9*5 4*10
+R38| 5*4 4*10 3*15 4*5 3*15 9*5 4*10
+R39| 5*4 4*10 3*15 4*5 3*15 9*5 4*10
+R40| 5*4 4*15 3*5 4*10 3*20 4*10
+R41| 5*4 4*15 3*5 4*10 3*20 4*10
+R42| 5*4 4*15 3*5 4*10 3*20 4*10
+R43| 5*4 4*15 3*5 4*10 3*20 4*10
+R44| 5*4 4*15 3*5 4*10 3*20 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*7 b*35 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*7 b*35 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 30-31, cols 49-53): 3 -> 12
+(rows 32-34, cols 49-53): 3 -> 9
+(rows 35-36, cols 49-53): 12 -> 3
+(rows 37-39, cols 49-53): 9 -> 3
+(rows 61-62, col 20): 11 -> 3
+
+### Counterexample 9 (trace step 8)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION1
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*40 4*10
+R26| 5*4 4*10 3*40 4*10
+R27| 5*4 4*10 3*40 4*10
+R28| 5*4 4*10 3*40 4*10
+R29| 5*4 4*10 3*40 4*10
+R30| 5*4 4*10 3*15 4*5 3*15 c*5 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*15 c*5 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*15 9*5 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*15 9*5 4*10
+R34| 5*4 4*10 3*15 4*5 3*15 9*5 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*20 4*10
+R41| 5*4 4*15 3*5 4*10 3*20 4*10
+R42| 5*4 4*15 3*5 4*10 3*20 4*10
+R43| 5*4 4*15 3*5 4*10 3*20 4*10
+R44| 5*4 4*15 3*5 4*10 3*20 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*8 b*34 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*8 b*34 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 25-26, cols 49-53): 3 -> 12
+(rows 27-29, cols 49-53): 3 -> 9
+(rows 30-31, cols 49-53): 12 -> 3
+(rows 32-34, cols 49-53): 9 -> 3
+(rows 61-62, col 21): 11 -> 3
+
+### Counterexample 10 (trace step 9)
+available actions for this row: GameAction.ACTION1, GameAction.ACTION2, GameAction.ACTION3, GameAction.ACTION4
+action actually taken on this row: GameAction.ACTION3
+your predicted grid_after:
+R 0| 5*4 4*60
+R 1| 5*4 4*60
+R 2| 5*4 4*60
+R 3| 5*4 4*60
+R 4| 5*4 4*60
+R 5| 5*4 4*60
+R 6| 5*4 4*60
+R 7| 5*4 4*60
+R 8| 5*4 4*28 3*9 4*23
+R 9| 5*4 4*28 3*1 5*7 3*1 4*23
+R10| 5*4 4*28 3*1 5*7 3*1 4*23
+R11| 5*4 4*28 3*1 5*2 9*3 5*2 3*1 4*23
+R12| 5*4 4*28 3*1 5*4 9*1 5*2 3*1 4*23
+R13| 5*4 4*28 3*1 5*2 9*1 5*1 9*1 5*2 3*1 4*23
+R14| 5*4 4*28 3*1 5*7 3*1 4*23
+R15| 5*4 4*28 3*1 5*7 3*1 4*23
+R16| 5*4 4*28 3*9 4*23
+R17| 5*4 4*30 3*5 4*25
+R18| 5*4 4*30 3*5 4*25
+R19| 5*4 4*30 3*5 4*25
+R20| 5*4 4*30 3*5 4*25
+R21| 5*4 4*30 3*5 4*25
+R22| 5*4 4*30 3*5 4*25
+R23| 5*4 4*30 3*5 4*25
+R24| 5*4 4*30 3*5 4*25
+R25| 5*4 4*10 3*35 c*5 4*10
+R26| 5*4 4*10 3*35 c*5 4*10
+R27| 5*4 4*10 3*35 9*5 4*10
+R28| 5*4 4*10 3*35 9*5 4*10
+R29| 5*4 4*10 3*35 9*5 4*10
+R30| 5*4 4*10 3*15 4*5 3*20 4*10
+R31| 5*4 4*10 3*7 0*1 3*7 4*5 3*20 4*10
+R32| 5*4 4*10 3*6 1*1 0*2 3*6 4*5 3*20 4*10
+R33| 5*4 4*10 3*7 1*1 3*7 4*5 3*20 4*10
+R34| 5*4 4*10 3*15 4*5 3*20 4*10
+R35| 5*4 4*10 3*15 4*5 3*20 4*10
+R36| 5*4 4*10 3*15 4*5 3*20 4*10
+R37| 5*4 4*10 3*15 4*5 3*20 4*10
+R38| 5*4 4*10 3*15 4*5 3*20 4*10
+R39| 5*4 4*10 3*15 4*5 3*20 4*10
+R40| 5*4 4*15 3*5 4*10 3*20 4*10
+R41| 5*4 4*15 3*5 4*10 3*20 4*10
+R42| 5*4 4*15 3*5 4*10 3*20 4*10
+R43| 5*4 4*15 3*5 4*10 3*20 4*10
+R44| 5*4 4*15 3*5 4*10 3*20 4*10
+R45| 5*4 4*15 3*35 4*10
+R46| 5*4 4*15 3*35 4*10
+R47| 5*4 4*15 3*35 4*10
+R48| 5*4 4*15 3*35 4*10
+R49| 5*4 4*15 3*35 4*10
+R50| 5*4 4*60
+R51| 5*4 4*60
+R52| 4*64
+R53| 4*1 5*10 4*53
+R54| 4*1 5*10 4*53
+R55| 4*1 5*2 9*6 5*2 4*53
+R56| 4*1 5*2 9*6 5*2 4*53
+R57| 4*1 5*2 9*2 5*6 4*53
+R58| 4*1 5*2 9*2 5*6 4*53
+R59| 4*1 5*2 9*2 5*2 9*2 5*2 4*53
+R60| 4*1 5*2 9*2 5*2 9*2 5*2 4*1 5*52
+R61| 4*1 5*10 4*1 5*1 3*9 b*33 5*1 8*2 5*1 8*2 5*1 8*2
+R62| 4*1 5*10 4*1 5*1 3*9 b*33 5*1 8*2 5*1 8*2 5*1 8*2
+R63| 4*12 5*52
+cells where your prediction differs from the correct grid, run-list format (your prediction -> correct):
+(rows 25-26, cols 44-48): 3 -> 12
+(rows 25-26, cols 49-53): 12 -> 3
+(rows 27-29, cols 44-48): 3 -> 9
+(rows 27-29, cols 49-53): 9 -> 3
+(rows 61-62, col 22): 11 -> 3
+
+
+Revise your GameModel class so it correctly handles these cases while continuing to handle the cases it already gets right. Two different kinds of fix are available, and picking the right one matters: if these counterexamples are consistent with your class's current picture of the game but reveal a gap in the rule itself (a case your logic doesn't cover, or a formula that's slightly off), patch or extend the existing logic, keeping what already works. If instead they reveal that what your class tracks as game state cannot represent what's actually happening, restructure that state representation, even if it means rewriting significant parts of the class — preserving code that doesn't correctly model the game is not the goal. Weigh this against your current class's overall accuracy stated above — a low figure despite several rounds of patches, not just whether these specific rows are failing, is a strong signal that patching the rule again won't fix it, and the state itself needs to change. A high overall accuracy suggests these counterexamples are isolated gaps, more likely fixable with a straightforward rule patch. Do not invent a special case tied to this specific batch of counterexamples (a hardcoded row/column/step number, or a condition that only explains the examples shown) as a substitute for either of these — that's neither a real rule fix nor a real state fix, it's memorizing this round's examples instead of modeling the game. Your predict method must keep this exact signature:
+
+    def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+        ...
+
+returning (predicted_grid_after, goal, state) exactly as before — see your class's own docstring above for what each element means if you need a reminder. grid_before is always a list of lists of plain integers 0-15 — never the compact display notation shown above, whichever form it takes — and predicted_grid_after must be in that same form. Reminder: backtest always replays your class from row 0, so previous_state still starts as an empty dict {} on that very first call regardless of which rows you're looking at here — don't let a change here reintroduce a KeyError on a key that isn't in previous_state yet (use previous_state.get("your_key", <default>) rather than previous_state["your_key"]). You may only import: copy, itertools, math, collections, functools, and numpy — no other modules, standard library or third-party. Return only the full, updated class definition, no explanation, no example usage.
+
+Define GameModel exactly ONCE, and define each of its methods exactly ONCE — revise or adjust the existing methods/fields shown above rather than writing multiple draft attempts, "actually, let me try again" rewrites, or alternate versions of the whole class. Every if/elif/else branch and every loop body must contain a real statement (return, assignment, pass, etc.) — never leave a branch with only a comment inside it.
+
+State what you changed in this revision in under 100 words TOTAL, as a comment/docstring in your class labeled exactly "REVISION:" — overwrite any previous "REVISION:" block already there rather than appending to it, so only your latest revision notes remain. Do not invent additional labeled sections to hold overflow notes (e.g. "NEW ADJUSTMENT:", "FINAL FIX:", "UPDATE:", or anything similar) — if your changes don't fit in 100 words under REVISION, summarize more tersely instead of adding another section. Your class's docstring must contain at most two labeled blocks in total: "DESCRIPTION:" and "REVISION:" — nothing else. Do not re-examine the same counterexamples repeatedly or restate your reasoning multiple times — write your best fix and move on, even if it's imperfect. You'll get another revision round later if something is still wrong.
+
+Reminder: predict() takes and returns plain Python int grids at runtime, never the display notation used above to show you the examples.
+
+Write your updated GameModel class now.

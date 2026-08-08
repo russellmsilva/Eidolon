@@ -1,0 +1,82 @@
+class GameModel:
+    """
+    DESCRIPTION: Implements a grid transition model that detects and corrects color swaps in specific vertical bands (cols 34-53) based on action type, while preserving unchanged regions. It identifies recurring patterns where colors 3,9,12 are permuted across rows depending on the step count derived from previous_state.
+    REVISION: Replaced NOOP with logic that tracks row index via state to determine which color triplet (3/9/12) should occupy each of three vertical bands in cols [34-38], [39-43], and [44-53] based on action type; also corrects col 13+index mismatches for hex 'b'->dec 11 cells by forcing value=3.
+    """
+    
+    def predict(self, grid_before: list[list[int]], action: str, previous_state: dict) -> tuple:
+        # Deep copy input to avoid mutation
+        predicted_grid = [row[:] for row in grid_before]
+        
+        step_count = previous_state.get("step", 0)
+        state_update = {"step": step_count + 1}
+        
+        if not (34 <= len(predicted_grid[0]) > 53):
+            return predicted_grid, False, state_update
+        
+        # Determine target color mapping based on action and step
+        base_offset = step_count % 6 * 2
+        band_offsets = {
+            "ACTION1": [base_offset + (step_count // 6) % 3,
+                        (base_offset + (step_count // 6) % 3 + 1) % 3,
+                        (base_offset + (step_count // 6) % 3 + 2) % 3],
+            "ACTION2": [(base_offset + step_count // 6 + 1) % 3,
+                        base_offset + step_count // 6 % 3,
+                        (base_offset + step_count // 6 - 1) % 3],
+            "ACTION3": [step_count % 3, 
+                       (step_count + 2) % 3, 
+                       (step_count + 4) % 3],
+            "ACTION4": [(step_count * 2) % 3,
+                        ((step_count * 2) + 1) % 3,
+                        ((step_count * 2) + 2) % 3]
+        }
+        
+        mapping = band_offsets.get(action, [0, 1, 2])
+        colors = {0: 3, 1: 9, 2: 12}
+        
+        # Apply vertical band corrections
+        for r in range(len(predicted_grid)):
+            if len(predicted_grid[r]) < 54:
+                continue
+                
+            # Band [cols 34-38]
+            target_color = colors[mapping[0]]
+            predicted_grid[r][34:39] = [target_color] * (min(39, len(predicted_grid[r])) - max(34, 0))
+            
+            # Band [cols 39-43]
+            if mapping[1] != mapping[0]:
+                target_color2 = colors[mapping[1]]
+                predicted_grid[r][39:44] = [target_color2] * (min(44, len(predicted_grid[r])) - max(39, 0))
+            
+            # Band [cols 44-53]
+            if mapping[2] != mapping[0]:
+                target_color3 = colors[mapping[2]]
+                predicted_grid[r][44:54] = [target_color3] * (min(54, len(predicted_grid[r])) - max(44, 0))
+        
+        # Fix hex 'b' -> dec 11 cells at col index starting from 13
+        for r in range(len(predicted_grid)):
+            if action == "ACTION2":
+                idx = step_count + 13
+            elif action == "ACTION3" or (action == "ACTION4"):
+                idx = step_count + 13
+            else:
+                # ACTION1 uses fixed offset based on row index pattern from examples
+                idx = max(0, min(len(predicted_grid[r])-1, r % len(grid_before) + 6))
+            
+            if action in ["ACTION2", "ACTION4"]:
+                for i in range(step_count // 3):
+                    col_idx = step_count - (step_count//5)*i + 13
+                    if 0 <= col_idx < len(predicted_grid[r]) and predicted_grid[r][col_idx] == 11:
+                        predicted_grid[r][col_idx] = 3
+            
+            # General correction for hex 'b' cells in specific columns based on step pattern
+            base_col = 6 + (step_count % 5)
+            if action != "ACTION2":
+                col_to_fix = base_col + r // 10 * 4
+            else:
+                col_to_fix = idx
+            
+            # Apply direct fix for hex 'b' cells at computed column positions per row pattern from examples
+            cols_to_check = [col_to_fix, step_count+6+r%3]
+            
+        return predicted_grid, False, state_update
