@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-trace_tools.py — chunked-curriculum program synthesis harness for Eidolon's
+trace_tools.py — chunked-curriculum program synthesis harness for Nosumina's
 GameModel candidates (ARC-AGI-3).
 
 Pipeline:
@@ -378,7 +378,7 @@ def build_bwrap_command(python_exe, runner_path_in_sandbox, staging_dir):
     # sys.executable lives inside the conda env; bind that tree at its
     # real path so the interpreter resolves its own stdlib/site-packages
     # normally, with no path remapping needed for Python itself.
-    conda_prefix = os.path.dirname(os.path.dirname(python_exe))  # .../envs/eidolon
+    conda_prefix = os.path.dirname(os.path.dirname(python_exe))  # .../envs/nosumina
 
     cmd = [
         bwrap_path,
@@ -733,7 +733,7 @@ def run_candidate(candidate_path, records, cpu_seconds=10, mem_mb=512,
     check_ast_imports(source)
 
     if use_sandbox:
-        staging_dir = tempfile.mkdtemp(prefix="eidolon_sandbox_")
+        staging_dir = tempfile.mkdtemp(prefix="nosumina_sandbox_")
     else:
         staging_dir = None
 
@@ -1457,7 +1457,7 @@ def atomic_copy_json(src_path, dst_path):
 
 def _write_temp_candidate_file(code):
     """Materialize a candidate code string to a throwaway temp .py file for run_backtest, which needs a path."""
-    fd, path = tempfile.mkstemp(suffix="_candidate.py", prefix="eidolon_chunk_round_")
+    fd, path = tempfile.mkstemp(suffix="_candidate.py", prefix="nosumina_chunk_round_")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(code)

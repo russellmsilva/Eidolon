@@ -51,7 +51,7 @@ def write_candidate(tmpdir, filename, body):
 
 
 def main():
-    tmpdir = tempfile.mkdtemp(prefix="eidolon_smoke_")
+    tmpdir = tempfile.mkdtemp(prefix="nosumina_smoke_")
     try:
         # ---- 1. Baseline sanity: does bwrap even run here? ----
         try:

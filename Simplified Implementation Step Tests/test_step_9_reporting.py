@@ -33,7 +33,7 @@ class GameModel:
 """
 
 
-workdir = tempfile.mkdtemp(prefix="eidolon_step9_test_")
+workdir = tempfile.mkdtemp(prefix="nosumina_step9_test_")
 counts_path = os.path.join(workdir, "row_failure_counts.json")
 best_counts_path = os.path.join(workdir, "row_failure_counts_best.json")
 
