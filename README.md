@@ -1,4 +1,4 @@
-# Nosumina
+# Nosumina Test PR
 
 Nosumina is a program-synthesis harness for [ARC-AGI-3](https://arcprize.org/): a local, quantized LLM writes and iteratively revises a `GameModel` class that predicts how a game's grid changes from one step to the next, on nothing but recorded gameplay traces. It's an open-source entry for the ARC-AGI-3 Kaggle competition's local-LLM-only track (no internet access, 12-hour runtime ceiling).
 
