@@ -6,9 +6,9 @@ A couple of things Eidolon adds on top of what Schema's paper describes: Eidolon
 
 Every contribution gets judged against one simple question: does this help the model reason better, or does it end up doing the model's reasoning for it? Good scaffolding makes the model's job easier without taking over the parts that are supposed to be its job — deciding what a shape means, what the rule is, what counts as progress. If a change starts making those decisions instead of the model, that's usually a sign it's solving the wrong problem.
 
-## New here?
+## Key Takeaways
 
-A few things worth knowing before you dive in:
+A few quick notes to help you get started with the codebase:
 
 - `SECURITY.md` explains the sandboxing setup and why it exists.
 - The "Known Limitations" section at the end of each implementation plan is a running list of things that were tried and didn't pan out, or gaps that are still open. It's worth a skim before proposing something new — there's a decent chance an idea has already been tried, and knowing why it didn't work will save you some time. We've already been through a few rounds of "this looked right until we checked it against real data" on some of these, so there are probably more problems we haven't found yet either — that's normal, not a sign anything's broken.
