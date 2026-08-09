@@ -54,7 +54,7 @@ def read_counts(path):
 
 import tempfile, os
 
-workdir = tempfile.mkdtemp(prefix="eidolon_step8_test_")
+workdir = tempfile.mkdtemp(prefix="nosumina_step8_test_")
 counts_path = os.path.join(workdir, "row_failure_counts.json")
 best_counts_path = os.path.join(workdir, "row_failure_counts_best.json")
 

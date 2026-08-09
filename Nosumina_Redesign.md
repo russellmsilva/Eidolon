@@ -1,4 +1,4 @@
-# Eidolon Harness Redesign — Collated Design & Test Plan
+# Nosumina Harness Redesign — Collated Design & Test Plan
 
 Purpose of this document: a single reference collating the architecture redesign discussed for `trace_tools.py`, scoped into what to build now vs. defer, with known limitations stated explicitly. Intended to be carried into a follow-up conversation before implementation begins.
 

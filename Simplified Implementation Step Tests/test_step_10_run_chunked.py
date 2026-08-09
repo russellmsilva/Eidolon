@@ -113,7 +113,7 @@ def write_trace(records, path):
 # 40->45 call, meaning chunk 4 (45:65) -- not chunk 3 (40:45) -- is the one
 # whose EXTEND_TEMPLATE should carry the level-boundary note.
 # ================================================================
-tmpdir = tempfile.mkdtemp(prefix="eidolon_step10_test_")
+tmpdir = tempfile.mkdtemp(prefix="nosumina_step10_test_")
 trace_path = os.path.join(tmpdir, "trace.jsonl")
 records = make_trace(80, level_row_idx=44)
 write_trace(records, trace_path)

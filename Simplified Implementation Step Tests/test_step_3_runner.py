@@ -1,6 +1,6 @@
 """
 Step 3 verification script. Run this on JarvisLabs with `conda activate
-eidolon`, from the same directory as trace_tools.py, WITH use_sandbox=True
+nosumina`, from the same directory as trace_tools.py, WITH use_sandbox=True
 (the default) to actually exercise bwrap. This file also runs standalone
 with USE_SANDBOX=False for a quick local plumbing check on a machine
 without bwrap -- see the constant below.

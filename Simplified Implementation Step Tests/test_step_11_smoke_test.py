@@ -42,7 +42,7 @@ def _unsandboxed_run_candidate(*a, **kw):
     return _orig_run_candidate(*a, **kw)
 tt.run_candidate = _unsandboxed_run_candidate
 
-tmpdir = tempfile.mkdtemp(prefix="eidolon_step11_test_")
+tmpdir = tempfile.mkdtemp(prefix="nosumina_step11_test_")
 
 
 # ================================================================

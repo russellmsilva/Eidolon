@@ -1,6 +1,6 @@
 """
 numpy/sandbox verification script -- run this on JarvisLabs with
-`conda activate eidolon`, from the same directory as trace_tools.py (or
+`conda activate nosumina`, from the same directory as trace_tools.py (or
 adjust the sys.path.insert below).
 
 Checks that a trivial candidate importing numpy runs cleanly through the
@@ -59,7 +59,7 @@ except Exception as e:
         "\nIf this looks like a bwrap bind error (numpy's compiled .so files or "
         "data living outside the conda_prefix bind), compare the numpy path "
         "printed above against conda_prefix in build_bwrap_command's --ro-bind "
-        "list. If numpy resolves to somewhere NOT under .../envs/eidolon, add "
+        "list. If numpy resolves to somewhere NOT under .../envs/nosumina, add "
         "its directory to the --ro-bind list explicitly."
     )
     sys.exit(1)
