@@ -1,8 +1,8 @@
-# Eidolon
+# Nosumina
 
-Eidolon is a program-synthesis harness for [ARC-AGI-3](https://arcprize.org/): a local, quantized LLM writes and iteratively revises a `GameModel` class that predicts how a game's grid changes from one step to the next, on nothing but recorded gameplay traces. It's an open-source entry for the ARC-AGI-3 Kaggle competition's local-LLM-only track (no internet access, 12-hour runtime ceiling).
+Nosumina is a program-synthesis harness for [ARC-AGI-3](https://arcprize.org/): a local, quantized LLM writes and iteratively revises a `GameModel` class that predicts how a game's grid changes from one step to the next, on nothing but recorded gameplay traces. It's an open-source entry for the ARC-AGI-3 Kaggle competition's local-LLM-only track (no internet access, 12-hour runtime ceiling).
 
-**The core thesis:** how you scaffold a model matters more than how big it is. Rather than trying to out-scale frontier models, Eidolon bets that a well-designed harness — persistent state, exhaustive certification against everything observed so far, and an explicit loop for revising _how_ the model represents the game, not just its rules — can unlock genuine capability from a small local model. If that holds up, the hope is it generalizes past ARC-AGI-3, to any domain where a model needs to build and revise a working model of its environment from observation rather than being told the rules up front.
+**The core thesis:** how you scaffold a model matters more than how big it is. Rather than trying to out-scale frontier models, Nosumina bets that a well-designed harness — persistent state, exhaustive certification against everything observed so far, and an explicit loop for revising _how_ the model represents the game, not just its rules — can unlock genuine capability from a small local model. If that holds up, the hope is it generalizes past ARC-AGI-3, to any domain where a model needs to build and revise a working model of its environment from observation rather than being told the rules up front.
 
 This project is a practical test of that bet, run against a real local model (Qwen3-Coder-Next, quantized) on real ARC-AGI-3 traces, with results — good or bad — treated as the actual point of the exercise.
 
@@ -15,7 +15,7 @@ This project is a practical test of that bet, run against a real local model (Qw
 5. **Revise.** Rows the candidate gets wrong are fed back as counterexamples, and the model is asked to fix its `GameModel` — not rewrite from scratch — for another round.
 6. **Advance the curriculum.** Once a chunk is solved (or a round budget is exhausted), the trace window advances and the process repeats, carrying the current-best code forward as the starting point for the next chunk.
 
-This design is inspired by [Schema (Zeng et al., 2026)](https://schema-harness.github.io), which showed that writing game mechanics as certified, executable programs — verified by replay against complete interaction history, with the state representation itself open to revision on contradiction — accounts for the bulk of a harness's performance, largely independent of the underlying model's raw size. Eidolon adapts that idea to a harder constraint Schema's own setup doesn't have to work within: no frontier model, no internet access, just a quantized model running locally end to end.
+This design is inspired by [Schema (Zeng et al., 2026)](https://schema-harness.github.io), which showed that writing game mechanics as certified, executable programs — verified by replay against complete interaction history, with the state representation itself open to revision on contradiction — accounts for the bulk of a harness's performance, largely independent of the underlying model's raw size. Nosumina adapts that idea to a harder constraint Schema's own setup doesn't have to work within: no frontier model, no internet access, just a quantized model running locally end to end.
 
 ## Why the candidate carries its own state
 
@@ -32,7 +32,7 @@ class GameModel:
 - `goal` — `bool`, whether this action is predicted to complete the current level.
 - `state` — a JSON-serializable dict (plain dicts/lists/numbers only) the candidate builds and reads itself, carried forward into the _next_ call as `previous_state`. On the first call of a fresh replay, `previous_state` is `{}`; the class is required to use `.get()` with defaults rather than direct indexing so a fresh rollout doesn't `KeyError`.
 
-The class may define whatever additional methods or fields it wants internally — `predict`'s signature is the only fixed part of the contract. This single-method shape is the _simplified_ diagnostic design currently implemented in `trace_tools.py`; a richer four-method contract (`init_state`/`step`/`sync_state`/`is_goal`) was designed as a fuller Tier 1 redesign (see `Eidolon_Redesign.md`) but is not what's currently running — the simplified version was built first, specifically to get a faster, cheaper read on whether the local model has any real capability here before investing in the larger design.
+The class may define whatever additional methods or fields it wants internally — `predict`'s signature is the only fixed part of the contract. This single-method shape is the _simplified_ diagnostic design currently implemented in `trace_tools.py`; a richer four-method contract (`init_state`/`step`/`sync_state`/`is_goal`) was designed as a fuller Tier 1 redesign (see `Nosumina_Redesign.md`) but is not what's currently running — the simplified version was built first, specifically to get a faster, cheaper read on whether the local model has any real capability here before investing in the larger design.
 
 ## Scoring
 
@@ -54,7 +54,7 @@ Full threat model, what's explicitly out of scope, and known limitations of each
 
 Actively in development, pre-results. Recent work:
 
-- **`analyze()` preprocessing pass** (design complete, implementation in progress): a second, smaller code-generation call that runs once per example, ahead of the `GameModel`-writing call, and reports structural facts about a single transition (translating, stationary/recolored, stationary/shape-changed, appeared, disappeared, ambiguous-match) computed from a shape-agnostic flood-fill component extractor. The goal is to offload "is this the same shape as before, just moved" onto deterministic code rather than asking the model to re-derive it from raw diffs, under token pressure, across every example, every round. Details and known limitations (correspondence ambiguity, multi-color sprite fragmentation, occlusion, no ground-truth certification for `analyze()` itself) are in [`Eidolon_Analyze_Preprocessing_Implementation_Plan.md`](./Eidolon_Analyze_Preprocessing_Implementation_Plan.md).
+- **`analyze()` preprocessing pass** (design complete, implementation in progress): a second, smaller code-generation call that runs once per example, ahead of the `GameModel`-writing call, and reports structural facts about a single transition (translating, stationary/recolored, stationary/shape-changed, appeared, disappeared, ambiguous-match) computed from a shape-agnostic flood-fill component extractor. The goal is to offload "is this the same shape as before, just moved" onto deterministic code rather than asking the model to re-derive it from raw diffs, under token pressure, across every example, every round. Details and known limitations (correspondence ambiguity, multi-color sprite fragmentation, occlusion, no ground-truth certification for `analyze()` itself) are in [`Nosumina_Analyze_Preprocessing_Implementation_Plan.md`](./Nosumina_Analyze_Preprocessing_Implementation_Plan.md).
 - **Sandbox hardening and security audit** completed, verified against a checklist on the actual GPU instance.
 - **`ls20`** (the ARC-AGI-3 game currently used as the test bed) mechanics reconstructed by hand: a player-controlled sprite, a step counter, an occluded switch decal, and a 3×3 indicator panel that changes pattern on activation — used as ground truth for validating the harness itself.
 
@@ -98,15 +98,15 @@ A JarvisLabs GPU instance with an RTX PRO 6000 (Blackwell, ~97GB VRAM) — the s
 
 ## Repository layout
 
-| Path                                                       | What it is                                                                                                             |
-| ---------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `trace_tools.py`                                           | The harness itself — all pipeline stages, single file                                                                  |
-| `SECURITY.md`                                              | Threat model and sandbox defense layers                                                                                |
-| `CONTRIBUTING.md`                                          | How to propose changes, and the "does this help the model reason, or reason for it" bar every change is judged against |
-| `Eidolon_Redesign.md`                                      | The full Tier 1 / Tier 2 harness redesign this codebase implements, with known limitations at every layer              |
-| `Eidolon_Simplified_Capability_Diagnostic_Architecture.md` | The specific, cheaper diagnostic design currently being run, and why it's scoped the way it is                         |
-| `Eidolon_Analyze_Preprocessing_Implementation_Plan.md`     | Design and step-by-step implementation plan for the `analyze()` preprocessing pass                                     |
-| `Worst_Case_Token_Testing.md`                              | Open task: pathological-trace token-budget testing to pick safe defaults for `--compact`/`--max-examples`/`--k`        |
+| Path                                                        | What it is                                                                                                             |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `trace_tools.py`                                            | The harness itself — all pipeline stages, single file                                                                  |
+| `SECURITY.md`                                               | Threat model and sandbox defense layers                                                                                |
+| `CONTRIBUTING.md`                                           | How to propose changes, and the "does this help the model reason, or reason for it" bar every change is judged against |
+| `Nosumina_Redesign.md`                                      | The full Tier 1 / Tier 2 harness redesign this codebase implements, with known limitations at every layer              |
+| `Nosumina_Simplified_Capability_Diagnostic_Architecture.md` | The specific, cheaper diagnostic design currently being run, and why it's scoped the way it is                         |
+| `Nosumina_Analyze_Preprocessing_Implementation_Plan.md`     | Design and step-by-step implementation plan for the `analyze()` preprocessing pass                                     |
+| `Worst_Case_Token_Testing.md`                               | Open task: pathological-trace token-budget testing to pick safe defaults for `--compact`/`--max-examples`/`--k`        |
 
 ## What's deliberately out of scope right now
 

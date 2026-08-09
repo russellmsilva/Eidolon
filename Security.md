@@ -1,6 +1,6 @@
 # Security Model
 
-Eidolon's harness asks an LLM to synthesize Python programs
+Nosumina's harness asks an LLM to synthesize Python programs
 ("candidates") that model a game's rules, then executes those programs to
 score them against recorded gameplay traces. This document describes how
 untrusted, LLM-generated code is contained, and what the harness deliberately

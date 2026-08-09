@@ -1,6 +1,6 @@
-# Eidolon — Simplified Capability-Diagnostic Architecture
+# Nosumina — Simplified Capability-Diagnostic Architecture
 
-Purpose of this document: a single reference collating the _simplified_ harness redesign discussed as a faster, cheaper alternative to the full Tier 1 redesign in `Eidolon_Redesign.md`, scoped specifically to answer one question — does the local model (Qwen3-Coder-Next-UD-Q4_K_XL) have any real capability to extract and encode an ARC-AGI-3 game's rules as an executable program — before investing further engineering time in either direction.
+Purpose of this document: a single reference collating the _simplified_ harness redesign discussed as a faster, cheaper alternative to the full Tier 1 redesign in `Nosumina_Redesign.md`, scoped specifically to answer one question — does the local model (Qwen3-Coder-Next-UD-Q4_K_XL) have any real capability to extract and encode an ARC-AGI-3 game's rules as an executable program — before investing further engineering time in either direction.
 
 **Revision note:** this version supersedes an earlier draft of this same document that ran the entire trace through a single backtest pass per round, with a continuous best-so-far checkpoint and no explicit curriculum ordering. That approach is replaced here by a **chunked curriculum** (§2–§7) after concluding that a single-pass design risked forcing the model to reconcile late-game and early-game mechanics simultaneously in one prompt, with no way to confirm it had solidified earlier mechanics before being shown later ones.
 

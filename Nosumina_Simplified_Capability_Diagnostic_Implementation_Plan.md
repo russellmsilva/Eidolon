@@ -1,6 +1,6 @@
-# Eidolon — Simplified Capability-Diagnostic: Implementation Plan
+# Nosumina — Simplified Capability-Diagnostic: Implementation Plan
 
-Companion to `Eidolon_Simplified_Diagnostic_Design.md`. That document is the reference for _what_ and _why_; this document is the ordered checklist for _building it_ in `trace_tools.py`. Each step names the functions it touches, what "done" looks like, and where to stop and test before moving on. Build in this order — later steps assume earlier ones are working, and the smoke test (Step 11) is a deliberate gate before any real GPU time is spent.
+Companion to `Nosumina_Simplified_Diagnostic_Design.md`. That document is the reference for _what_ and _why_; this document is the ordered checklist for _building it_ in `trace_tools.py`. Each step names the functions it touches, what "done" looks like, and where to stop and test before moving on. Build in this order — later steps assume earlier ones are working, and the smoke test (Step 11) is a deliberate gate before any real GPU time is spent.
 
 **Revision note:** this version reflects the chunked-curriculum design (design doc §2–§8), replacing an earlier draft of this plan built around a single full-trace pass per round. Steps below that changed substantially from that earlier draft say so explicitly.
 
@@ -35,7 +35,7 @@ Current `keep_first_function_def(source, func_name="predict_next_state")` scans 
 - Add `"numpy"` to the `ALLOWED_IMPORTS` set.
 - Verify importability inside bwrap specifically — write a one-line throwaway candidate (`import numpy; ...`) and run it through the existing `run_candidate` sandboxed path.
 
-**Done when:** a trivial candidate that does `import numpy` runs successfully through `run_candidate` with `use_sandbox=True`, with no `bwrap` bind errors. If it fails, confirm where numpy actually lives in the `eidolon` conda env (`python -c "import numpy; print(numpy.__file__)"`) and add its path to the `--ro-bind` list in `build_bwrap_command` if `conda_prefix`'s existing bind doesn't already cover it.
+**Done when:** a trivial candidate that does `import numpy` runs successfully through `run_candidate` with `use_sandbox=True`, with no `bwrap` bind errors. If it fails, confirm where numpy actually lives in the `nosumina` conda env (`python -c "import numpy; print(numpy.__file__)"`) and add its path to the `--ro-bind` list in `build_bwrap_command` if `conda_prefix`'s existing bind doesn't already cover it.
 
 ---
 
@@ -54,7 +54,7 @@ Current `keep_first_function_def(source, func_name="predict_next_state")` scans 
 
 Small, self-contained piece of logic that Step 10's outer loop calls at the start of every chunk to decide how many new rows this chunk covers. Implement and unit-test it in isolation before wiring it into the loop — it's a pure function over already-loaded trace data (no LLM, no sandbox), so there's no reason to only discover a bug here once a real run is underway.
 
-- Signature roughly: `next_chunk_boundary(records, prev_boundary, max_examples) -> int`, where `records` is the full cleaned trace (each record already carries whatever `levels_completed`/goal ground-truth field `preprocess`/`--score-key` extracted — see `Eidolon_Redesign.md` §2 and design doc §9, which already assume this field is available for goal scoring; boundary computation reuses the same field, no new extraction needed).
+- Signature roughly: `next_chunk_boundary(records, prev_boundary, max_examples) -> int`, where `records` is the full cleaned trace (each record already carries whatever `levels_completed`/goal ground-truth field `preprocess`/`--score-key` extracted — see `Nosumina_Redesign.md` §2 and design doc §9, which already assume this field is available for goal scoring; boundary computation reuses the same field, no new extraction needed).
 - Formula (design doc §2):
 
   ```python
