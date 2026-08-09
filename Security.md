@@ -102,6 +102,15 @@ its own:
   can be used if this exposure ever becomes more relevant to the operator's
   threat model than it currently is.
 
+## Responsible disclosure
+
+If you find a way to break out of the sandbox, bypass a defense layer, or otherwise get a candidate program to do something this document says it shouldn't be able to do, please report it privately rather than opening a public issue or PR — a public report gives anyone reading the repo a working exploit before there's a fix.
+
+- **Email:** russell.miguel.silva [at] gmail [dot] com. Include what you found, how to reproduce it, and (if you have one) how bad the impact is — a candidate reading files it shouldn't vs. a full sandbox escape are very different severities and it helps to say which you think this is.
+- There's no bug bounty here; this is a research project, not a funded product. If that changes later, this section will say so.
+
+This threat model treats every candidate program as untrusted regardless of intent (see above) — so a "the model just happened to write something exploitable, nobody was actually attacking it" report is exactly as welcome and useful as a deliberately crafted one. Both are real gaps in the same containment.
+
 ## Testing
 
 Sandbox containment is exercised by an automated smoke test "sandbox_smoke_test.py"

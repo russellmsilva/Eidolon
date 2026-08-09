@@ -116,9 +116,17 @@ A JarvisLabs GPU instance with an RTX PRO 6000 (Blackwell, ~97GB VRAM) — the s
 - **The three-layer Multi-Resolution Heuristic Solver** (a Semantic/LLM layer, a Graph Topological layer via NetworkX, a Discrete Matrix layer via SciPy/NumPy) and MCTS planning on top of it — the longer-term architectural vision for this project, deliberately deferred until the core synthesis-and-certification loop is validated on its own. When this phase begins, note that a naive graph-topology bonus (simplicial complex construction, Laplacian spectral properties) was already tested as an MCTS selection signal on ARC-style grids and found to produce no improvement — see [Solution Space Topology Guides MCTS Search](https://arxiv.org/abs/2511.01701). The same paper found a more targeted structural feature, rigidity analysis identifying bottleneck cells, did help, which should be the starting point for this project's Graph Topological layer rather than generic connectivity/spectral scoring.
 - **Object segmentation/ID tracking across frames, attribute-based type-grouping, correlation-ranking over sparse events, and an LLM history-query tool** — generalization machinery for games with moving/variable-count objects or sparse hidden triggers, built only if the core loop plateaus _and_ a manual playthrough confirms a given game actually needs it.
 
-## Contributing
+## Collaboration & Contact
 
-Start with [`CONTRIBUTING.md`](./CONTRIBUTING.md) — in particular, the "Known Limitations" section at the end of each design doc is a running list of things already tried that didn't pan out; worth a skim before proposing something new. The short version of the project's review philosophy: every contribution gets judged on whether it helps the model reason better, or ends up doing the model's reasoning for it.
+Fork it, make a change, open a pull request — that's the whole process, no permission needed first. One requirement: commits need to be signed off (git commit -s) per the DCO — PRs without it won't pass the required check. Beyond that, [`CONTRIBUTING.md`](./CONTRIBUTING.md) has more on what a good PR or a bigger proposal looks like.
+
+I review and merge every PR myself, so it might take a few days depending on what else is going on — I'll get back to you either way, even if it's just a question to understand what you're going for — rather than leaving a PR unreviewed.
+
+If you end up contributing regularly, I'll add you as a collaborator so you can work directly against the repo instead of through a fork.
+
+If you want to reach out directly please contact me at **russell.miguel.silva [at] gmail [dot] com**.
+
+For security issues: please don't open a public issue — see `SECURITY.md` for responsible disclosure.
 
 ## License
 
