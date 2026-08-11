@@ -1,10 +1,14 @@
 # Nosumina
 
-Nosumina is a program-synthesis harness for [ARC-AGI-3](https://arcprize.org/): a local, quantized LLM writes and iteratively revises a `GameModel` class that predicts how a game's grid changes from one step to the next, on nothing but recorded gameplay traces. It's an open-source entry for the ARC-AGI-3 Kaggle competition's local-LLM-only track (no internet access, 12-hour runtime ceiling).
+I want to help a post-scarcity future arrive safely. One where the work required just to survive finally fades away, and we all get our time back, for our health, or for a life we've wanted for ourselves but were never able to have. Getting there safely matters as much as getting there at all. A future where automation and artificial reasoning is cheap and abundant is also a future where that power is easy to misuse, and that's the part I'd like to help get right. Nosumina is my small, early attempt at that. If this is a future you want too, I'd like to build it with you.
 
-**The core thesis:** how you scaffold a model matters more than how big it is. Rather than trying to out-scale frontier models, Nosumina bets that a well-designed harness — persistent state, exhaustive certification against everything observed so far, and an explicit loop for revising _how_ the model represents the game, not just its rules — can unlock genuine capability from a small local model. If that holds up, the hope is it generalizes past ARC-AGI-3, to any domain where a model needs to build and revise a working model of its environment from observation rather than being told the rules up front.
+What stands in this repository today is far humbler than any of that. Close to nothing works yet. What follows is simply a layout of the bet I'm making and the reasoning behind it, not a claim that the bet has paid off.
 
-This project is a practical test of that bet, run against a real local model (Qwen3-Coder-Next, quantized) on real ARC-AGI-3 traces, with results — good or bad — treated as the actual point of the exercise.
+The current test of that bet is [ARC-AGI-3](https://arcprize.org/), a Kaggle competition built around games no model has seen before. It is played under strict constraints: a local-LLM-only environment with no internet access, no frontier models, and run entirely offline. Nosumina is my open-source entry in that track. Inside its architecture, a small local model quietly writes and revises a Python program — a `GameModel` — that tries to predict how a game's grid shifts from one step to the next. It must learn entirely from recorded gameplay traces, rather than being handed the rules. My bet isn't that a larger model would do this better; it's that a well-built harness wrapped around a small one can go further than model scale alone would suggest.
+
+If this design holds up on ARC-AGI-3, it could be retrofitted toward the kind of autonomous systems that could actually usher in a post-scarcity future such as automated farms and delivery robots. But getting there requires navigating two gaps this repo hasn't crossed yet: a preprocessing layer that can adapt to entirely new kinds of data, and a way to give the system a goal at all.
+
+That second gap is the one I take more seriously. Right now, the current architecture doesn't hand the model a goal like "keep this farm alive." A system optimizing relentlessly for a goal like that needs real alignment work first, or it will find the cheapest way to reach the goal rather than what anyone actually intended. That's a future direction for this project, not a claim about what it can do today.
 
 ## How it works
 
@@ -59,6 +63,67 @@ Actively in development, pre-results. Recent work:
 - **`ls20`** (the ARC-AGI-3 game currently used as the test bed) mechanics reconstructed by hand: a player-controlled sprite, a step counter, an occluded switch decal, and a 3×3 indicator panel that changes pattern on activation — used as ground truth for validating the harness itself.
 
 An earlier, stateless harness scored 0.8% exact-match / 5.5% changed-cell accuracy on held-out ls20 data — statistically indistinguishable from the ~6.25% random baseline. That result is a large part of why the harness was redesigned around persistent state and exhaustive certification. Near-0% exact-match on predicting the next grid is currently the state of the architecture even under that redesign. The analyze() preprocessing pass below is aimed at the deeper, still-open part of the problem: the model characterizing noise rather than forming a real concept of what it's looking at. Whether that's a fixable harness gap or a real ceiling in the local model is still the open question this project is trying to answer.
+
+## Quickstart
+
+**Before you start:** even a fully correct run of this harness currently ends near 0% exact-match accuracy on the grid-prediction task. That's not a sign something went wrong — it's the current state of the architecture. This Quickstart will get the harness _running end to end_, not get you an accurate `GameModel`.
+
+**What you need:**
+
+- A Linux host with a CUDA-capable GPU with **at least ~48GB VRAM** (this project is developed and tested against an RTX PRO 6000 Blackwell, 96GB VRAM, running Qwen3-Coder-Next at Q4_K_XL quantization, which alone uses ~49GB)
+- Python 3.12
+- `llama-cpp-python` already built **with CUDA support** — this is the step most likely to silently go wrong (a failed CUDA detection during build falls back to a CPU-only build with no error). Verify before continuing:
+  ```bash
+  python3 -c "from llama_cpp import llama_cpp as lib; print(lib.llama_supports_gpu_offload())"
+  ```
+  This must print `True`.
+- `bubblewrap` installed and working (`bwrap --version`) — required to sandbox candidate code execution, independent of which inference backend you use
+- `numpy` (the only non-stdlib dependency the harness itself needs)
+
+Don't have a CUDA GPU, or need help getting any of the above working? See [`FULL_ENVIRONMENT_SETUP.md`](./FULL_ENVIRONMENT_SETUP.md) for a from-scratch cloud GPU setup, including a known CUDA-build failure mode and how to catch it.
+
+**Steps:**
+
+1. **Get a trace.** The fastest path: use [`trace.jsonl`](./trace.jsonl), a 400-row trace included at the repo root. Optionally, you can record your own by playing a game yourself with [`my_agent_keyboard.py`](./my_agent_keyboard.py) (see the docstring at the top of that file for how to swap it into the [ARC-AGI-3-Kaggle-Starter Repo](https://github.com/arcprize/ARC-AGI-3-Kaggle-Starter)). This step is optional; skip straight to step 2 if you just want to see the harness run.
+
+2. **Get the model weights.** Download Qwen3-Coder-Next-UD-Q4_K_XL (GGUF) from Unsloth's Hugging Face repo. `/home/cloud/models/...` below is just the path used on this project's own JarvisLabs setup — swap it for wherever you want the weights to live on your machine:
+
+   ```bash
+   pip install huggingface_hub
+   mkdir -p /home/cloud/models
+   huggingface-cli download unsloth/Qwen3-Coder-Next-GGUF \
+       --include "*UD-Q4_K_XL*" \
+       --local-dir /home/cloud/models/qwen3-coder-next
+   ```
+
+3. **Preprocess the trace.**
+
+   ```bash
+   python trace_tools.py preprocess trace.jsonl clean.jsonl --frame-key frame --action-key action
+   ```
+
+   (Optionally run `python trace_tools.py inspect trace.jsonl --frame-key frame` first if you're using your own trace instead of the bundled one, to confirm its `frame` field structure. `inspect` checks the nesting depth of `pre_observation.frame` and `post_observation.frame` across every record: it wants **2 levels of nesting** — a plain `list[rows][cols]`, i.e. a single settled grid — not 3, which would mean each record still holds a list of grids (one per intermediate animation tick) rather than the final collapsed one. `my_agent_keyboard.py`'s `_serialize_frame_for_trace` already collapses to depth 2 before writing, so the bundled trace and anything recorded with that script will pass this check automatically. If `inspect` reports a mix of depths or anything other than a consistent `{2}`, don't run `preprocess` yet — the frames still need to be collapsed to their final tick first, or `preprocess` will operate on the wrong shape.)
+
+4. **Run the harness.**
+   ```bash
+   python trace_tools.py run-chunked clean.jsonl \
+       --backend llama-cpp --model-path /path/to/model.Q4_K_M.gguf \
+       --n-gpu-layers -1 --n-ctx 131072 --max-examples 20 --max-rounds 2 \
+       --compact --repeat-penalty 1.3 --frequency-penalty 0.1 --presence-penalty 0.1 \
+       --workdir chunked_run --verbose-llama
+   ```
+   These are the recommended settings for a first run. By default this pauses before every LLM call so you can inspect the prompt — pass `--automatic` once you trust it to run unattended.
+
+**What you'll see, and what it means.** Everything `run-chunked` produces lands in `--workdir` (`chunked_run` above) — see [`Results_8_4_2026`](./Results_8_4_2026) in this repo for a real example of what that directory looks like after a full run. A few files worth knowing:
+
+- **`chunk{N}_candidate_round{M}.py`** — the actual `GameModel` class the model wrote for chunk `N`, round `M`. Open one of these directly; it's plain, readable Python, not a black box.
+- **`chunk_log.jsonl`** — one JSON line per round, recording what was accepted or rejected and why, across the whole run.
+- **Per-round accuracy, printed to the terminal and logged**, comes in three numbers, and they mean different things:
+  - **Exact-match accuracy** — the strict pass rate: did the candidate predict the _entire_ grid correctly, cell for cell? This is the headline number, and it's the one that's currently near 0%.
+  - **Accuracy on cells that actually changed** — restricted to just the cells that differ between `grid_before` and `grid_after`, ignoring the (usually large) static background. This is the number that reflects whether the model is learning real game dynamics, since a candidate that changes nothing at all can still score high on the next metric below.
+  - **Mean per-cell accuracy (all cells)** — nearly every grid is mostly static from one step to the next, so this number is inflated by cells a candidate gets right just by leaving them alone. A do-nothing candidate can score deceptively well here; it's included for completeness, not as the metric to trust.
+
+So: if your first run ends with exact-match near 0%, changed-cell accuracy low, and per-cell accuracy misleadingly high — that's not a broken run. That's this project's actual, current result, and matches what's archived in `Results_8_4_2026`.
 
 ## Usage
 
@@ -124,7 +189,7 @@ I review and merge every PR myself, so it might take a few days depending on wha
 
 If you end up contributing regularly, I'll add you as a collaborator so you can work directly against the repo instead of through a fork.
 
-If you want to reach out directly please contact me at **russell.miguel.silva [at] gmail [dot] com**.
+Whether you're just curious about the project, find yourself at odds with my design choices, or wish to collaborate on something bigger than a PR, I'd like to hear from you: **russell.miguel.silva [at] gmail [dot] com**.
 
 For security issues: please don't open a public issue — see `SECURITY.md` for responsible disclosure.
 
