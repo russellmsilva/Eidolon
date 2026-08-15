@@ -114,7 +114,7 @@ Don't have a CUDA GPU, or need help getting any of the above working? See [`FULL
    ```
    These are the recommended settings for a first run. By default this pauses before every LLM call so you can inspect the prompt — pass `--automatic` once you trust it to run unattended.
 
-**What you'll see, and what it means.** Everything `run-chunked` produces lands in `--workdir` (`chunked_run` above) — see [`Results_8_4_2026`](./Results_8_4_2026) in this repo for a real example of what that directory looks like after a full run. A few files worth knowing:
+**What you'll see, and what it means.** Everything `run-chunked` produces lands in `--workdir` (`chunked_run` above) — see [Results 8_4_2026](./Results%208_4_2026) in this repo for a real example of what that directory looks like after a full run. A few files worth knowing:
 
 - **`chunk{N}_candidate_round{M}.py`** — the actual `GameModel` class the model wrote for chunk `N`, round `M`. Open one of these directly; it's plain, readable Python, not a black box.
 - **`chunk_log.jsonl`** — one JSON line per round, recording what was accepted or rejected and why, across the whole run.
@@ -168,7 +168,7 @@ A JarvisLabs GPU instance with an RTX PRO 6000 (Blackwell, ~97GB VRAM) — the s
 | `trace_tools.py`                                            | The harness itself — all pipeline stages, single file                                                                  |
 | `SECURITY.md`                                               | Threat model and sandbox defense layers                                                                                |
 | `CONTRIBUTING.md`                                           | How to propose changes, and the "does this help the model reason, or reason for it" bar every change is judged against |
-| `Nosumina_Redesign.md`                                      | The full Tier 1 / Tier 2 harness redesign this codebase implements, with known limitations at every layer              |
+| `Nosumina_Redesign.md`                                      | The full Tier 1 / Tier 2 harness redesign that was replaced by the Simplified Diagnostic Architecture                  |
 | `Nosumina_Simplified_Capability_Diagnostic_Architecture.md` | The specific, cheaper diagnostic design currently being run, and why it's scoped the way it is                         |
 | `Nosumina_Analyze_Preprocessing_Implementation_Plan.md`     | Design and step-by-step implementation plan for the `analyze()` preprocessing pass                                     |
 | `Worst_Case_Token_Testing.md`                               | Open task: pathological-trace token-budget testing to pick safe defaults for `--compact`/`--max-examples`/`--k`        |
